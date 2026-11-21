@@ -1,0 +1,38 @@
+FROM ubuntu:26.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV UV_PYTHON_INSTALL_DIR=/opt/uv-python
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    unzip \
+    wine \
+    wine64 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+
+RUN uv python install 3.14.10 3.15.2
+
+RUN mkdir -p /opt/winpy314 /opt/winpy315 \
+    && curl -fsSL https://api.nuget.org/v3-flatcontainer/python/3.14.10/python.3.14.10.nupkg -o /tmp/py314.nupkg \
+    && unzip -q /tmp/py314.nupkg "tools/*" -d /opt/winpy314 \
+    && rm -f /tmp/py314.nupkg \
+    && curl -fsSL https://api.nuget.org/v3-flatcontainer/python/3.15.2/python.3.15.2.nupkg -o /tmp/py315.nupkg \
+    && unzip -q /tmp/py315.nupkg "tools/*" -d /opt/winpy315 \
+    && rm -f /tmp/py315.nupkg
+
+RUN useradd -m -u 10001 tester \
+    && mkdir -p /home/tester/.run \
+    && chown tester:tester /home/tester/.run \
+    && chmod 700 /home/tester/.run \
+    && su -s /bin/bash tester -c "XDG_RUNTIME_DIR=/home/tester/.run WINEDEBUG=-all wineboot --init && /usr/lib/x86_64-linux-gnu/wine/wineserver -w"
+
+USER tester
+ENV HOME=/home/tester
+ENV WINEPREFIX=/home/tester/.wine
+ENV WINEDEBUG=-all
+ENV XDG_RUNTIME_DIR=/home/tester/.run
+ENV PATH="/usr/lib/x86_64-linux-gnu/wine:${PATH}"
+WORKDIR /work

@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "simpyremote"
+version = "0.1.0"
+description = "Simple, secure, cross-platform Python remote execution, shell, RPC, and file transfer over TLS 1.3 PSK."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{name = "noonomyen"}]
+requires-python = ">=3.14"
+dependencies = []
+keywords = ["remote", "shell", "pty", "rpc", "tls", "psk", "file-transfer"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: Microsoft :: Windows",
+]
+
+[project.urls]
+Homepage = "https://github.com/noonomyen/simpyremote"
+Repository = "https://github.com/noonomyen/simpyremote"
+Issues = "https://github.com/noonomyen/simpyremote/issues"
+
+[project.scripts]
+simpyremote = "simpyremote.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

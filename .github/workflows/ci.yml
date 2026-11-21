@@ -1,0 +1,131 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.14"
+      - name: Lint source, scripts, tests, and amalgamated single-file
+        run: |
+          uvx ruff check --select E,F,I,UP,RUF --ignore E501 src scripts tests
+          uv run --no-project --python 3.14 python scripts/build_single.py dist/simpyremote.py
+          uvx ruff check --select E,F,I,UP,RUF --ignore E501 dist/simpyremote.py
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.14", "3.15"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Install Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
+      - name: Run unittest suite
+        run: uv run --no-project --python ${{ matrix.python-version }} python -m unittest discover -s tests -v
+      - name: Verify package installation and console entrypoint
+        shell: bash
+        run: |
+          uv venv --python ${{ matrix.python-version }} .pkg_venv
+          uv pip install --python .pkg_venv .
+          BIN=".pkg_venv/bin/simpyremote"
+          if [ -f ".pkg_venv/Scripts/simpyremote.exe" ]; then
+            BIN=".pkg_venv/Scripts/simpyremote.exe"
+          fi
+          "$BIN" --help >/dev/null
+
+  build:
+    needs: [lint, test]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact_name: simpyremote-linux-x86_64
+            bin_path: dist/simpyremote
+          - os: windows-latest
+            artifact_name: simpyremote-windows-x86_64
+            bin_path: dist/simpyremote.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Setup build environment
+        run: |
+          uv python install 3.14
+          uv venv --python 3.14 .venv
+          uv pip install --python .venv pyinstaller
+      - name: Build single-file script and PyInstaller binary
+        shell: bash
+        run: |
+          PY=".venv/bin/python"
+          PYI=".venv/bin/pyinstaller"
+          if [ -f ".venv/Scripts/python.exe" ]; then
+            PY=".venv/Scripts/python.exe"
+            PYI=".venv/Scripts/pyinstaller.exe"
+          fi
+          "$PY" scripts/build_single.py dist/simpyremote.py
+          "$PYI" --onefile --clean --name simpyremote --distpath ./dist --workpath ./build --specpath ./build ./dist/simpyremote.py
+      - name: Smoke test compiled binary
+        shell: bash
+        env:
+          BIN_PATH: ${{ matrix.bin_path }}
+        run: |
+          PY=".venv/bin/python"
+          if [ -f ".venv/Scripts/python.exe" ]; then
+            PY=".venv/Scripts/python.exe"
+          fi
+          "$PY" - <<'PY'
+          import os, subprocess, sys
+          bin_path = os.environ["BIN_PATH"]
+          secret = "ci_e2e_secret_123456789012345678"
+          srv = subprocess.Popen(
+              [bin_path, "--server", "127.0.0.1", "--port", "0", "--pre-auth", secret],
+              stdout=subprocess.PIPE,
+              stderr=subprocess.PIPE,
+              text=True,
+          )
+          try:
+              line = srv.stderr.readline()
+              assert "listening on 127.0.0.1:" in line and secret not in line, line
+              port = int(line.split("127.0.0.1:", 1)[1].split(" ", 1)[0])
+              cli_out = subprocess.check_output(
+                  [bin_path, "--remote", f"127.0.0.1:{port}", "--auth", secret, "--", sys.executable, "-c", 'print("cli_ok")'],
+                  text=True,
+              )
+              assert cli_out.strip() == "cli_ok", cli_out
+              py_out = subprocess.check_output(
+                  [
+                      sys.executable,
+                      "-c",
+                      f'import sys; sys.path.insert(0, "dist"); from simpyremote import Client; print(Client(remote="127.0.0.1:{port}", auth={secret!r}).call(lambda x: (x + 1, __name__), 41))',
+                  ],
+                  text=True,
+              )
+              assert py_out.strip() == "[42, '__main__']", py_out
+          finally:
+              srv.terminate()
+              srv.wait(timeout=5)
+              srv.stdout.close()
+              srv.stderr.close()
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: |
+            ${{ matrix.bin_path }}
+            dist/simpyremote.py

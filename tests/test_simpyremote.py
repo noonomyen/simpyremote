@@ -1,0 +1,892 @@
+import base64
+import codecs
+import functools
+import io
+import json
+import math
+import os
+import pickle
+import shutil
+import socket
+import ssl
+import stat
+import subprocess
+import sys
+import tarfile
+import tempfile
+import threading
+import time
+import unittest
+from contextlib import redirect_stdout
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+
+from simpyremote import Client, RemoteError, call, pull, push, run, serve
+from simpyremote.cli import main as cli_main
+from simpyremote.client import _flush_text_decoder, _write_stream
+from simpyremote.config import (
+    generate_secret,
+    parse_remote_spec,
+    resolve_client_config,
+    resolve_server_secret,
+    split_argv_at_double_dash,
+)
+from simpyremote.io_pump import _is_wine, _PtyEscapeFilter
+from simpyremote.proto import (
+    FRAME_EXEC_CMD,
+    FRAME_EXEC_PY,
+    FRAME_EXIT,
+    FRAME_RESIZE,
+    FRAME_RETURN,
+    FRAME_SIGNAL,
+    FRAME_STARTED,
+    FRAME_STDIN,
+    FRAME_STDOUT,
+    recv_frame,
+    send_frame,
+    send_json,
+)
+from simpyremote.serialize import (
+    _build_callable_from_job,
+    _is_json_primitive,
+    serialize_callable,
+)
+from simpyremote.tls import (
+    build_client_ssl_context,
+    build_server_ssl_context,
+    connect_tls,
+    derive_psk,
+    handshake_with_deadline,
+)
+from simpyremote.transfer import (
+    _prepare_tar_members,
+    _resolve_dest_file,
+    _sanitize_leaf_name,
+)
+
+_WRAP_SCALE = 3
+
+
+def _noop_wrap(fn):
+    @functools.wraps(fn)
+    def _inner(*args, **kwargs):
+        return fn(*args, **kwargs)
+
+    return _inner
+
+
+@_noop_wrap
+def _wrapped_math_fn(n: int) -> int:
+    return math.isqrt(n) * _WRAP_SCALE
+
+
+def _recursive_fact(n: int) -> int:
+    return 1 if n <= 1 else n * _recursive_fact(n - 1)
+
+
+class SimpyRemoteTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._stop = threading.Event()
+        self._ready = threading.Event()
+        self.port = 0
+        self.secret = ""
+
+        def _on_listen(_host: str, port: int, secret: str, _generated: bool) -> None:
+            self.port = port
+            self.secret = secret
+            self._ready.set()
+
+        self._srv_thread = threading.Thread(
+            target=serve,
+            kwargs={
+                "host": "127.0.0.1",
+                "port": 0,
+                "pre_auth": None,
+                "stop_event": self._stop,
+                "on_listening": _on_listen,
+            },
+            daemon=True,
+        )
+        self._srv_thread.start()
+        self.assertTrue(self._ready.wait(timeout=5.0))
+        self.client = Client(remote=f"127.0.0.1:{self.port}", auth=self.secret)
+
+    def tearDown(self) -> None:
+        self._stop.set()
+        self._srv_thread.join(timeout=3.0)
+
+    def test_secret_generation_and_split(self) -> None:
+        self.assertEqual(len(self.secret), 32)
+        self.assertTrue(self.secret.isalnum())
+        s = generate_secret()
+        self.assertEqual(len(s), 32)
+        cli, cmd = split_argv_at_double_dash(
+            ["--remote", "1.2.3.4:2222", "--", "python3", "--help"]
+        )
+        self.assertEqual(cli, ["--remote", "1.2.3.4:2222"])
+        self.assertEqual(cmd, ["python3", "--help"])
+        for bad in ("", ":2222", "[]", "[]:2222"):
+            with self.assertRaises(ValueError):
+                parse_remote_spec(bad)
+
+    def test_rc_file_and_cli_override(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            rc = Path(tmp) / ".simpyremote"
+            rc.write_text("addr=10.0.0.5\nport=3333\nsecret=rcsecret1234567890\n", encoding="utf-8")
+            if os.name == "posix":
+                os.chmod(rc, 0o600)
+            old_cwd = os.getcwd()
+            old_env = os.environ.pop("SIMPYREMOTE_SECRET", None)
+            old_cfg = os.environ.pop("SIMPYREMOTE_CONFIG", None)
+            old_home = os.environ.get("HOME")
+            try:
+                os.environ["HOME"] = str(Path(tmp) / "empty_home")
+                os.chdir(tmp)
+                cfg = resolve_client_config()
+                self.assertEqual(
+                    (cfg.addr, cfg.port, cfg.secret),
+                    ("10.0.0.5", 3333, "rcsecret1234567890"),
+                )
+                over = resolve_client_config(
+                    remote="192.168.0.100", auth="override_secret_1234"
+                )
+                self.assertEqual(
+                    (over.addr, over.port, over.secret),
+                    ("192.168.0.100", 2222, "override_secret_1234"),
+                )
+                if os.name == "posix":
+                    os.chmod(rc, 0o666)
+                    with self.assertRaises(ValueError):
+                        resolve_client_config()
+            finally:
+                os.chdir(old_cwd)
+                if old_home is None:
+                    os.environ.pop("HOME", None)
+                else:
+                    os.environ["HOME"] = old_home
+                if old_env is not None:
+                    os.environ["SIMPYREMOTE_SECRET"] = old_env
+                if old_cfg is not None:
+                    os.environ["SIMPYREMOTE_CONFIG"] = old_cfg
+
+    def test_server_secret_precedence(self) -> None:
+        old = os.environ.get("SIMPYREMOTE_SECRET")
+        try:
+            os.environ["SIMPYREMOTE_SECRET"] = "env_secret_1234567890"
+            sec, gen = resolve_server_secret()
+            self.assertEqual((sec, gen), ("env_secret_1234567890", False))
+            sec2, gen2 = resolve_server_secret("cli_secret_1234567890")
+            self.assertEqual((sec2, gen2), ("cli_secret_1234567890", False))
+        finally:
+            if old is None:
+                os.environ.pop("SIMPYREMOTE_SECRET", None)
+            else:
+                os.environ["SIMPYREMOTE_SECRET"] = old
+
+    def test_tls_rejects_wrong_secret(self) -> None:
+        bad_client = Client(remote=f"127.0.0.1:{self.port}", auth="wrong_secret_1234567890")
+        with self.assertRaises(ssl.SSLError):
+            bad_client.run_cmd([sys.executable, "-c", "print(1)"])
+
+    def test_tls_rejects_cert_downgrade_mitm(self) -> None:
+        cli_ctx = build_client_ssl_context(derive_psk(self.secret))
+        self.assertEqual(cli_ctx.verify_mode, ssl.CERT_REQUIRED)
+        self.assertEqual(cli_ctx.cert_store_stats()["x509_ca"], 0)
+        openssl_bin = shutil.which("openssl")
+        if openssl_bin is None:
+            return
+        with tempfile.TemporaryDirectory() as tmp:
+            cert = Path(tmp) / "mitm.crt"
+            key = Path(tmp) / "mitm.key"
+            subprocess.run(
+                [
+                    openssl_bin,
+                    "req",
+                    "-x509",
+                    "-newkey",
+                    "ec",
+                    "-pkeyopt",
+                    "ec_paramgen_curve:prime256v1",
+                    "-keyout",
+                    str(key),
+                    "-out",
+                    str(cert),
+                    "-days",
+                    "1",
+                    "-nodes",
+                    "-subj",
+                    "/CN=mitm.example.com",
+                ],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            mitm_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            mitm_ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+            mitm_ctx.load_cert_chain(certfile=str(cert), keyfile=str(key))
+
+            with socket.create_server(("127.0.0.1", 0)) as srv:
+                mitm_port = srv.getsockname()[1]
+
+                def _mitm_accept() -> None:
+                    conn, _ = srv.accept()
+                    try:
+                        with mitm_ctx.wrap_socket(conn, server_side=True):
+                            pass
+                    except OSError:
+                        pass
+                    finally:
+                        conn.close()
+
+                t = threading.Thread(target=_mitm_accept, daemon=True)
+                t.start()
+                with self.assertRaises(ssl.SSLError):
+                    connect_tls("127.0.0.1", mitm_port, cli_ctx)
+                t.join(timeout=3.0)
+
+    def test_call_rejects_serializer_mismatch_pickle_downgrade(self) -> None:
+        psk = derive_psk(self.secret)
+        srv_ctx = build_server_ssl_context(psk)
+        evil_payload = base64.b64encode(pickle.dumps({"pwn": True})).decode("ascii")
+
+        with socket.create_server(("127.0.0.1", 0)) as srv:
+            fake_port = srv.getsockname()[1]
+
+            def _fake_srv() -> None:
+                conn, _ = srv.accept()
+                try:
+                    with handshake_with_deadline(conn, srv_ctx, server_side=True) as tls:
+                        first = recv_frame(tls)
+                        assert first is not None and first[0] == FRAME_EXEC_PY
+                        send_json(tls, FRAME_STARTED, {"pid": 1})
+                        send_json(
+                            tls,
+                            FRAME_RETURN,
+                            {"ok": True, "serializer": "pickle", "value": evil_payload},
+                        )
+                        send_json(tls, FRAME_EXIT, {"returncode": 0})
+                finally:
+                    conn.close()
+
+            t = threading.Thread(target=_fake_srv, daemon=True)
+            t.start()
+            c = Client(remote=f"127.0.0.1:{fake_port}", auth=self.secret)
+            with self.assertRaises(RemoteError) as ctx:
+                c.call(lambda: 1)
+            self.assertIn("Serializer mismatch", str(ctx.exception))
+            t.join(timeout=3.0)
+
+    def test_run_cmd_pipes_stdin_and_hold_until_exit(self) -> None:
+        out_buf = io.StringIO()
+        in_buf = io.BytesIO(b"hello-stdin-data")
+        start = time.monotonic()
+        rc = self.client.run_cmd(
+            [
+                sys.executable,
+                "-c",
+                "import sys, time; data = sys.stdin.read(); print('got:' + data); time.sleep(0.2); exit(7)",
+            ],
+            stdin=in_buf,
+            stdout=out_buf,
+        )
+        elapsed = time.monotonic() - start
+        self.assertEqual(rc, 7)
+        self.assertGreaterEqual(elapsed, 0.15)
+        self.assertIn("got:hello-stdin-data", out_buf.getvalue())
+
+        bin_out = io.BytesIO()
+        bin_err = io.BytesIO()
+        rc_bin = self.client.run_cmd(
+            [
+                sys.executable,
+                "-c",
+                "import sys; sys.stdout.buffer.write(b'\\xff\\xfe\\x00\\x80'); sys.stderr.buffer.write(b'\\x01\\x02')",
+            ],
+            pty=False,
+            stdin=io.BytesIO(),
+            stdout=bin_out,
+            stderr=bin_err,
+        )
+        self.assertEqual(rc_bin, 0)
+        self.assertEqual(bin_out.getvalue(), b"\xff\xfe\x00\x80")
+        self.assertEqual(bin_err.getvalue(), b"\x01\x02")
+
+    def test_server_strips_secret_from_child_env(self) -> None:
+        old = os.environ.get("SIMPYREMOTE_SECRET")
+        os.environ["SIMPYREMOTE_SECRET"] = "must_not_leak_secret_123456"
+        try:
+            def read_env() -> str | None:
+                import os
+
+                return os.environ.get("SIMPYREMOTE_SECRET")
+
+            self.assertIsNone(self.client.call(read_env))
+        finally:
+            if old is None:
+                os.environ.pop("SIMPYREMOTE_SECRET", None)
+            else:
+                os.environ["SIMPYREMOTE_SECRET"] = old
+
+    def test_run_python_function_and_module_globals(self) -> None:
+        def x() -> None:
+            print(__name__)
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = self.client.run(x)
+        self.assertEqual(rc, 0)
+        self.assertEqual(buf.getvalue().strip(), "__main__")
+
+    def test_call_rpc_stateless_and_stdout_isolation(self) -> None:
+        def get_cwd_after_chdir(target: str) -> str:
+            import os
+
+            print("noisy debug line")
+            os.chdir(target)
+            return os.getcwd()
+
+        with tempfile.TemporaryDirectory() as d1:
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                res1 = self.client.call(get_cwd_after_chdir, d1)
+            self.assertEqual(Path(res1).resolve(), Path(d1).resolve())
+            self.assertIn("noisy debug line", buf.getvalue())
+
+            res2 = self.client.call(os.getcwd)
+            self.assertNotEqual(Path(res2).resolve(), Path(d1).resolve())
+
+        lam_res = self.client.call(lambda a, b: a + b, 19, 23)
+        self.assertEqual(lam_res, 42)
+
+        pickled = self.client.call_with(lambda: (b"raw", {1, 2}), serializer="pickle")
+        self.assertEqual(pickled, (b"raw", {1, 2}))
+
+    def test_call_non_json_return_reports_clear_error(self) -> None:
+        def bad_return() -> bytes:
+            return b"not-json"
+
+        with self.assertRaises(RemoteError) as ctx:
+            self.client.call(bad_return)
+        self.assertIn("Failed to serialize", str(ctx.exception))
+
+    def test_call_propagates_remote_exception(self) -> None:
+        def boom() -> None:
+            raise KeyError("missing-item")
+
+        with self.assertRaises(RemoteError) as ctx:
+            self.client.call(boom)
+        self.assertIn("KeyError", str(ctx.exception))
+        self.assertIn("missing-item", str(ctx.exception))
+
+    def test_bytecode_fallback_with_closure_and_builtin_normalization(self) -> None:
+        factor = 7
+        ns: dict[str, object] = {}
+        exec("def mul(v):\n    return v * factor\n", {"factor": factor}, ns)
+        dyn_fn = ns["mul"]
+        job = serialize_callable(dyn_fn, (6,), {}, mode="call", serializer="json")
+        self.assertEqual(job["kind"], "code")
+        rebuilt = _build_callable_from_job(job)
+        self.assertEqual(rebuilt(6), 42)
+
+        def make_adder(base: int):
+            def inner(x: int) -> int:
+                return base + x
+
+            return inner
+
+        closure_fn = make_adder(10)
+        cjob = serialize_callable(closure_fn, (5,), {}, mode="call", serializer="json")
+        cjob["kind"] = "code"
+        import marshal
+
+        cjob["code_b64"] = base64.b64encode(marshal.dumps(closure_fn.__code__)).decode("ascii")
+        rebuilt_closure = _build_callable_from_job(cjob)
+        self.assertEqual(rebuilt_closure(5), 15)
+
+        builtin_job = serialize_callable(os.getcwd, (), {}, mode="call", serializer="json")
+        self.assertEqual(builtin_job["module"], "os")
+        with self.assertRaises(TypeError):
+            serialize_callable("hello".upper, (), {}, mode="call", serializer="json")
+
+    def test_push_and_pull_file_directory_and_security(self) -> None:
+        for bad_name in ("", ".", "..", "/etc/passwd", "../evil", "a/b", "a\\b", "C:evil", "a\x00b"):
+            with self.assertRaises(ValueError):
+                _sanitize_leaf_name(bad_name)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with self.assertRaises(ValueError):
+                _resolve_dest_file(str(root), "../escape.txt")
+
+            src_file = root / "hello.bin"
+            payload = os.urandom(150_000)
+            src_file.write_bytes(payload)
+            if os.name == "posix":
+                os.chmod(src_file, 0o666)
+
+            remote_file = root / "remote_copy.bin"
+            pulled_file = root / "pulled_copy.bin"
+            _, pushed_sz = self.client.push(src_file, str(remote_file))
+            self.assertEqual(pushed_sz, len(payload))
+            self.assertEqual(remote_file.read_bytes(), payload)
+            if os.name == "posix":
+                mode = remote_file.stat().st_mode
+                self.assertEqual(mode & (stat.S_IWGRP | stat.S_IWOTH), 0)
+
+            _, pulled_sz = self.client.pull(str(remote_file), pulled_file)
+            self.assertEqual(pulled_sz, len(payload))
+            self.assertEqual(pulled_file.read_bytes(), payload)
+
+            src_dir = root / "pkg_dir"
+            (src_dir / "sub").mkdir(parents=True)
+            (src_dir / "a.txt").write_text("alpha", encoding="utf-8")
+            (src_dir / "sub" / "b.txt").write_text("beta", encoding="utf-8")
+
+            remote_dst = root / "remote_out"
+            self.client.push(src_dir, str(remote_dst), recursive=True)
+            self.assertEqual(
+                (remote_dst / "pkg_dir" / "a.txt").read_text(encoding="utf-8"), "alpha"
+            )
+            self.assertEqual(
+                (remote_dst / "pkg_dir" / "sub" / "b.txt").read_text(encoding="utf-8"), "beta"
+            )
+
+            local_back = root / "local_back"
+            self.client.pull(str(remote_dst / "pkg_dir"), local_back, recursive=True)
+            self.assertEqual(
+                (local_back / "pkg_dir" / "sub" / "b.txt").read_text(encoding="utf-8"), "beta"
+            )
+
+    def test_signal_interrupt_terminates_remote_process(self) -> None:
+        ctx = build_client_ssl_context(derive_psk(self.secret))
+        with connect_tls("127.0.0.1", self.port, ctx) as sock:
+            send_json(
+                sock,
+                FRAME_EXEC_CMD,
+                {"argv": [sys.executable, "-c", "import time; time.sleep(30)"], "cwd": None},
+            )
+            started = recv_frame(sock)
+            self.assertIsNotNone(started)
+            assert started is not None
+            self.assertEqual(started[0], FRAME_STARTED)
+
+            send_frame(sock, FRAME_SIGNAL, b"INT")
+            exit_frame = None
+            while True:
+                fr = recv_frame(sock)
+                if fr is None:
+                    break
+                if fr[0] == FRAME_EXIT:
+                    exit_frame = fr
+                    break
+            self.assertIsNotNone(exit_frame)
+
+    def test_cli_edge_cases(self) -> None:
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = cli_main(
+                [
+                    "--remote",
+                    f"127.0.0.1:{self.port}",
+                    "--auth",
+                    self.secret,
+                    "--",
+                    sys.executable,
+                    "-c",
+                    "import sys; print(sys.argv[1])",
+                    "--_worker",
+                ]
+            )
+        self.assertEqual(rc, 0)
+        self.assertEqual(buf.getvalue().strip(), "--_worker")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            rc_err = cli_main(
+                [
+                    "--remote",
+                    f"127.0.0.1:{self.port}",
+                    "--auth",
+                    self.secret,
+                    "--pull",
+                    str(Path(tmp) / "does_not_exist.bin"),
+                    str(Path(tmp) / "out.bin"),
+                ]
+            )
+            self.assertEqual(rc_err, 1)
+
+        with self.assertRaises(SystemExit) as cm:
+            cli_main(["--push", "a", "b", "--pull", "c", "d"])
+        self.assertEqual(cm.exception.code, 2)
+        for bad_cli in (
+            ["--server", "127.0.0.1", "-r"],
+            ["-r", "--", "echo", "hi"],
+            ["-t", "-T", "--", "echo", "hi"],
+            ["-t", "--push", "a", "b"],
+        ):
+            with self.assertRaises(SystemExit) as cm_bad:
+                cli_main(bad_cli)
+            self.assertEqual(cm_bad.exception.code, 2)
+
+    def test_frame_started_always_first_on_fast_command(self) -> None:
+        ctx = build_client_ssl_context(derive_psk(self.secret))
+        for _ in range(5):
+            with connect_tls("127.0.0.1", self.port, ctx) as sock:
+                send_json(
+                    sock,
+                    FRAME_EXEC_CMD,
+                    {"argv": [sys.executable, "-c", "print('fast')"], "cwd": None, "pty": False},
+                )
+                first = recv_frame(sock)
+                self.assertIsNotNone(first)
+                assert first is not None
+                self.assertEqual(first[0], FRAME_STARTED)
+                while True:
+                    fr = recv_frame(sock)
+                    if fr is None or fr[0] == FRAME_EXIT:
+                        break
+
+    def test_pty_escape_filter_and_tar_validation(self) -> None:
+        filt = _PtyEscapeFilter()
+        self.assertEqual(filt.feed(b"echo ~/ok\r"), (b"echo ~/ok\r", False))
+        self.assertEqual(filt.feed(b"~~hello\n"), (b"~hello\n", False))
+        self.assertEqual(filt.feed(b"~/dir\r"), (b"~/dir\r", False))
+        self.assertEqual(filt.feed(b"~."), (b"", True))
+
+        def _make_tar_with(members: list[tuple[str, int, str]]) -> io.BytesIO:
+            raw = io.BytesIO()
+            with tarfile.open(fileobj=raw, mode="w") as tf:
+                for name, mtype, linkname in members:
+                    info = tarfile.TarInfo(name=name)
+                    info.type = mtype
+                    if linkname:
+                        info.linkname = linkname
+                    elif mtype == tarfile.REGTYPE:
+                        info.size = 1
+                        tf.addfile(info, io.BytesIO(b"x"))
+                        continue
+                    tf.addfile(info)
+            raw.seek(0)
+            return raw
+
+        for evil in (
+            [(".bashrc", tarfile.REGTYPE, "")],
+            [("safe/hl", tarfile.LNKTYPE, "other/file")],
+            [("safe/abs_link", tarfile.SYMTYPE, "/etc/passwd")],
+        ):
+            with tarfile.open(fileobj=_make_tar_with(evil), mode="r:") as tf:
+                with self.assertRaises(ValueError):
+                    _prepare_tar_members(tf, "safe")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            dst_dir = Path(tmp)
+            target_dir = dst_dir / "safe"
+            target_dir.mkdir()
+            two_step_escape = _make_tar_with(
+                [
+                    ("safe/a/b", tarfile.DIRTYPE, ""),
+                    ("safe/a/b/link1", tarfile.SYMTYPE, "../.."),
+                    ("safe/a/b/link1/link2", tarfile.SYMTYPE, ".."),
+                    ("safe/a/b/link1/link2/.bashrc", tarfile.REGTYPE, ""),
+                ]
+            )
+            with tarfile.open(fileobj=two_step_escape, mode="r:") as tf:
+                with self.assertRaises((ValueError, tarfile.TarError)):
+                    members = _prepare_tar_members(tf, "safe")
+                    tf.extractall(path=target_dir, members=members, filter="data")
+            self.assertFalse((dst_dir / ".bashrc").exists())
+
+            good_tar = _make_tar_with(
+                [
+                    ("safe", tarfile.DIRTYPE, ""),
+                    ("safe/a.txt", tarfile.REGTYPE, ""),
+                    ("safe/sub", tarfile.DIRTYPE, ""),
+                    ("safe/sub/link", tarfile.SYMTYPE, "../a.txt"),
+                ]
+            )
+            with tarfile.open(fileobj=good_tar, mode="r:") as tf:
+                members = _prepare_tar_members(tf, "safe")
+                tf.extractall(path=target_dir, members=members, filter="data")
+            self.assertTrue((target_dir / "a.txt").is_file())
+
+    def test_async_gen_rejected_and_recursive_pickle_safe(self) -> None:
+        async def agen():
+            yield 1
+
+        with self.assertRaises(TypeError):
+            serialize_callable(agen, (), {}, mode="call", serializer="json")
+
+        class _Holder:
+            def method(self) -> int:
+                return 1
+
+        with self.assertRaises(TypeError):
+            serialize_callable(_Holder().method, (), {}, mode="call", serializer="json")
+
+        cyclic: list[object] = []
+        cyclic.append(cyclic)
+        self.assertFalse(_is_json_primitive(cyclic))
+
+        self.assertEqual(self.client.call(_wrapped_math_fn, 49), 21)
+
+        def _make_nonlocal_mod_fn():
+            import math as m_local
+
+            def _inner(x: int) -> int:
+                return m_local.isqrt(x)
+
+            return _inner
+
+        self.assertEqual(self.client.call(_make_nonlocal_mod_fn(), 64), 8)
+
+        job = serialize_callable(_recursive_fact, (5,), {}, mode="call", serializer="pickle")
+        self.assertNotIn("_recursive_fact", job.get("bindings", {}))
+        self.assertEqual(self.client.call_with(_recursive_fact, args=(5,), serializer="pickle"), 120)
+
+    def test_detached_child_drains_large_stdout_without_deadlock(self) -> None:
+        ctx = build_client_ssl_context(derive_psk(self.secret))
+        with tempfile.TemporaryDirectory() as tmp:
+            done_marker = Path(tmp) / "done.txt"
+            code = (
+                "import pathlib, sys, time; "
+                "time.sleep(0.15); "
+                "sys.stdout.buffer.write(b'x' * 220000); "
+                "sys.stdout.buffer.flush(); "
+                f"pathlib.Path({str(done_marker)!r}).write_text('ok', encoding='utf-8')"
+            )
+            with connect_tls("127.0.0.1", self.port, ctx) as sock:
+                send_json(
+                    sock,
+                    FRAME_EXEC_CMD,
+                    {"argv": [sys.executable, "-c", code], "cwd": None, "pty": False},
+                )
+                started = recv_frame(sock)
+                self.assertIsNotNone(started)
+                assert started is not None
+                self.assertEqual(started[0], FRAME_STARTED)
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline and not done_marker.exists():
+                time.sleep(0.05)
+            self.assertTrue(done_marker.is_file())
+
+    def test_incremental_utf8_stream_decoding(self) -> None:
+        buf = io.StringIO()
+        dec = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        sample = "hello-\u00e9-\u2603-\U0001f600"
+        raw = sample.encode("utf-8")
+        for i in range(0, len(raw), 2):
+            _write_stream(buf, raw[i : i + 2], dec)
+        _flush_text_decoder(buf, dec)
+        self.assertEqual(buf.getvalue(), sample)
+
+    @unittest.skipUnless(sys.platform == "win32" and not _is_wine(), "Windows ConPTY test")
+    def test_windows_conpty_interactive_and_resize(self) -> None:
+        ctx = build_client_ssl_context(derive_psk(self.secret))
+        with connect_tls("127.0.0.1", self.port, ctx) as sock:
+            sock.settimeout(5.0)
+            send_json(
+                sock,
+                FRAME_EXEC_CMD,
+                {
+                    "argv": [
+                        sys.executable,
+                        "-c",
+                        "import os, sys, time; time.sleep(0.2); print('CONPTY_SZ', tuple(os.get_terminal_size()), flush=True)",
+                    ],
+                    "cwd": None,
+                    "pty": True,
+                    "cols": 90,
+                    "rows": 30,
+                },
+            )
+            started = recv_frame(sock)
+            self.assertIsNotNone(started)
+            assert started is not None
+            self.assertEqual(started[0], FRAME_STARTED)
+            self.assertTrue(json.loads(started[1].decode("utf-8")).get("pty"))
+            send_json(sock, FRAME_RESIZE, {"cols": 105, "rows": 33})
+            out = bytearray()
+            rc = None
+            while True:
+                fr = recv_frame(sock)
+                if fr is None:
+                    break
+                if fr[0] == FRAME_STDOUT:
+                    out.extend(fr[1])
+                elif fr[0] == FRAME_EXIT:
+                    rc = int(json.loads(fr[1].decode("utf-8"))["returncode"])
+                    break
+            self.assertEqual(rc, 0)
+            self.assertIn(b"CONPTY_SZ", bytes(out))
+
+    @unittest.skipUnless(os.name == "posix", "POSIX PTY realtime test")
+    def test_pty_interactive_python_repl_and_resize(self) -> None:
+        ctx = build_client_ssl_context(derive_psk(self.secret))
+        with connect_tls("127.0.0.1", self.port, ctx) as sock:
+            sock.settimeout(5.0)
+            send_json(
+                sock,
+                FRAME_EXEC_CMD,
+                {
+                    "argv": [sys.executable, "-q"],
+                    "cwd": None,
+                    "pty": True,
+                    "cols": 90,
+                    "rows": 30,
+                    "term": "xterm-256color",
+                },
+            )
+            started = recv_frame(sock)
+            self.assertIsNotNone(started)
+            assert started is not None
+            self.assertEqual(started[0], FRAME_STARTED)
+            start_info = json.loads(started[1].decode("utf-8"))
+            self.assertTrue(start_info.get("pty"))
+
+            def _read_until(needle: bytes, timeout: float = 5.0) -> bytes:
+                buf = bytearray()
+                deadline = time.monotonic() + timeout
+                while time.monotonic() < deadline:
+                    sock.settimeout(max(0.1, deadline - time.monotonic()))
+                    fr = recv_frame(sock)
+                    if fr is None:
+                        break
+                    if fr[0] == FRAME_STDOUT:
+                        buf.extend(fr[1])
+                        if needle in buf:
+                            return bytes(buf)
+                return bytes(buf)
+
+            banner = _read_until(b">>>")
+            self.assertIn(b">>>", banner)
+
+            send_frame(sock, FRAME_STDIN, b"print(123 + 456)\r")
+            calc = _read_until(b"579")
+            self.assertIn(b"579", calc)
+
+            send_json(sock, FRAME_RESIZE, {"cols": 111, "rows": 37})
+            send_frame(sock, FRAME_STDIN, b"import os; print(tuple(os.get_terminal_size()))\r")
+            resized = _read_until(b"(111, 37)")
+            self.assertIn(b"(111, 37)", resized)
+
+            send_frame(sock, FRAME_STDIN, b"import time; time.sleep(5)\r")
+            time.sleep(0.2)
+            send_frame(sock, FRAME_STDIN, b"\x03")
+            interrupted = _read_until(b"KeyboardInterrupt")
+            self.assertIn(b"KeyboardInterrupt", interrupted)
+            if b">>>" not in interrupted.split(b"KeyboardInterrupt", 1)[1]:
+                _read_until(b">>>")
+
+            send_frame(sock, FRAME_STDIN, b"\x04")
+            exit_rc = None
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                sock.settimeout(max(0.1, deadline - time.monotonic()))
+                fr = recv_frame(sock)
+                if fr is None:
+                    break
+                if fr[0] == FRAME_EXIT:
+                    exit_rc = int(json.loads(fr[1].decode("utf-8"))["returncode"])
+                    break
+            self.assertEqual(exit_rc, 0)
+
+    def test_recv_frame_truncated_header_raises(self) -> None:
+        s1, s2 = socket.socketpair()
+        try:
+            s1.sendall(b"\x01\x00")
+            s1.close()
+            with self.assertRaises(EOFError):
+                recv_frame(s2)
+        finally:
+            s2.close()
+
+    def test_top_level_helpers_with_rc_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            rc_path = Path(tmp) / ".simpyremote"
+            rc_path.write_text(
+                f"addr=127.0.0.1\nport={self.port}\nsecret={self.secret}\n",
+                encoding="utf-8",
+            )
+            if os.name == "posix":
+                os.chmod(rc_path, 0o600)
+            old_cwd = os.getcwd()
+            old_env = os.environ.pop("SIMPYREMOTE_SECRET", None)
+            old_cfg = os.environ.pop("SIMPYREMOTE_CONFIG", None)
+            try:
+                os.chdir(tmp)
+                self.assertEqual(call(lambda n: n * 2, 21), 42)
+                buf = io.StringIO()
+                with redirect_stdout(buf):
+                    self.assertEqual(run(lambda: print(__name__)), 0)
+                self.assertEqual(buf.getvalue().strip(), "__main__")
+                src = Path(tmp) / "top.txt"
+                dst = Path(tmp) / "top_up.txt"
+                back = Path(tmp) / "top_down.txt"
+                src.write_text("top", encoding="utf-8")
+                push(src, str(dst))
+                pull(str(dst), back)
+                self.assertEqual(back.read_text(encoding="utf-8"), "top")
+            finally:
+                os.chdir(old_cwd)
+                if old_env is not None:
+                    os.environ["SIMPYREMOTE_SECRET"] = old_env
+                if old_cfg is not None:
+                    os.environ["SIMPYREMOTE_CONFIG"] = old_cfg
+
+
+class SingleFileDistributionTests(unittest.TestCase):
+    def test_amalgamated_single_file_server_and_import(self) -> None:
+        repo_root = Path(__file__).resolve().parent.parent
+        build_script = repo_root / "scripts" / "build_single.py"
+        with tempfile.TemporaryDirectory() as tmp:
+            dist_py = Path(tmp) / "simpyremote.py"
+            subprocess.run([sys.executable, str(build_script), str(dist_py)], check=True)
+            self.assertTrue(dist_py.is_file())
+
+            secret = "singlefile_test_secret_1234567890"
+            proc = subprocess.Popen(
+                [
+                    sys.executable,
+                    str(dist_py),
+                    "--server",
+                    "127.0.0.1",
+                    "--port",
+                    "0",
+                    "--pre-auth",
+                    secret,
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            try:
+                assert proc.stderr is not None
+                line = proc.stderr.readline()
+                self.assertIn("listening on 127.0.0.1:", line)
+                self.assertNotIn(secret, line)
+                bound_port = int(line.split("127.0.0.1:", 1)[1].split(" ", 1)[0])
+
+                out = subprocess.check_output(
+                    [
+                        sys.executable,
+                        "-c",
+                        (
+                            f"import sys; sys.path.insert(0, {str(dist_py.parent)!r}); "
+                            f"from simpyremote import Client; "
+                            f"c = Client(remote='127.0.0.1:{bound_port}', auth={secret!r}); "
+                            f"print(c.call(lambda: __name__))"
+                        ),
+                    ],
+                    text=True,
+                )
+                self.assertEqual(out.strip(), "__main__")
+            finally:
+                proc.terminate()
+                proc.wait(timeout=5)
+                if proc.stdout is not None:
+                    proc.stdout.close()
+                if proc.stderr is not None:
+                    proc.stderr.close()
+
+
+if __name__ == "__main__":
+    unittest.main()
