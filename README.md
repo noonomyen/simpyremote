@@ -27,10 +27,10 @@ On the target machine:
 # Auto-generate a random 32-character secret
 simpyremote --server 0.0.0.0 --port 2222
 
-# Or set your own secret
+# Or set your own secret (pass --ignore-warnings to suppress short-secret warnings)
 SIMPYREMOTE_SECRET=mysecret simpyremote --server 0.0.0.0 --port 2222
 # or
-simpyremote --server 0.0.0.0 --port 2222 --pre-auth mysecret
+simpyremote --server 0.0.0.0 --port 2222 --pre-auth mysecret --ignore-warnings
 ```
 
 ### 2. Configure Client (`.simpyremote`)
@@ -41,9 +41,11 @@ Optionally save your connection details in `./.simpyremote` or `~/.simpyremote`:
 addr=192.168.0.100
 port=2222
 secret=mysecret
+# Optional: suppress non-fatal security warnings (short secret, .simpyremote permissions)
+ignore_warnings=true
 ```
 
-CLI flags (`--remote`, `--auth`) override `.simpyremote`.
+CLI flags (`--remote`, `--auth`, `--ignore-warnings`) override `.simpyremote`.
 
 ### 3. Run Commands & Transfer Files
 
@@ -106,6 +108,7 @@ See [docs/guide.md](docs/guide.md) for the full CLI/API reference, serialization
 
 - Anyone who knows the shared secret has full command execution as the server user. Prefer the auto-generated 32-character secret or a long random secret.
 - Restrict `.simpyremote` permissions (`chmod 600 .simpyremote`) and do not run `simpyremote` blindly inside untrusted repositories that might contain a `.simpyremote` file.
+- Secrets shorter than 16 characters and group/other-readable `.simpyremote` files emit non-fatal warnings to `stderr`; pass `--ignore-warnings` (or set `ignore_warnings=true` in `.simpyremote`) to silence them.
 
 ## Build & Test
 

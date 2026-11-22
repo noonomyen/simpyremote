@@ -17,7 +17,7 @@ import tempfile
 import threading
 import time
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
@@ -26,6 +26,7 @@ from simpyremote import Client, RemoteError, call, pull, push, run, serve
 from simpyremote.cli import main as cli_main
 from simpyremote.client import _flush_text_decoder, _write_stream
 from simpyremote.config import (
+    ClientConfig,
     generate_secret,
     parse_remote_spec,
     resolve_client_config,
@@ -169,6 +170,219 @@ class SimpyRemoteTests(unittest.TestCase):
                     os.environ["SIMPYREMOTE_SECRET"] = old_env
                 if old_cfg is not None:
                     os.environ["SIMPYREMOTE_CONFIG"] = old_cfg
+
+    def test_ignore_warnings_flag_and_rc(self) -> None:
+        err_default = io.StringIO()
+        with redirect_stderr(err_default):
+            Client(remote="127.0.0.1:2222", auth="short")
+        self.assertIn("secret is shorter than 16 chars", err_default.getvalue())
+
+        err_api = io.StringIO()
+        with redirect_stderr(err_api):
+            c_api = Client(remote="127.0.0.1:2222", auth="short", ignore_warnings=True)
+        self.assertTrue(c_api.config.ignore_warnings)
+        self.assertEqual(err_api.getvalue(), "")
+
+        err_cfg_override = io.StringIO()
+        with redirect_stderr(err_cfg_override):
+            c_cfg = Client(
+                config=ClientConfig("127.0.0.1", 2222, "short", ignore_warnings=False),
+                ignore_warnings=True,
+            )
+        self.assertTrue(c_cfg.config.ignore_warnings)
+        self.assertEqual(err_cfg_override.getvalue(), "")
+
+        def _serve_short(ignore_warnings: bool) -> tuple[str, int]:
+            stop = threading.Event()
+            err_srv = io.StringIO()
+            bound: list[int] = []
+
+            def _on_listen(_h: str, p: int, _s: str, _g: bool) -> None:
+                bound.append(p)
+                stop.set()
+
+            def _run() -> None:
+                with redirect_stderr(err_srv):
+                    serve(
+                        host="127.0.0.1",
+                        port=0,
+                        pre_auth="short",
+                        stop_event=stop,
+                        on_listening=_on_listen,
+                        ignore_warnings=ignore_warnings,
+                    )
+
+            t = threading.Thread(target=_run, daemon=True)
+            t.start()
+            t.join(timeout=3.0)
+            self.assertFalse(t.is_alive())
+            return err_srv.getvalue(), bound[0]
+
+        srv_warn_err, _ = _serve_short(False)
+        self.assertIn("secret is shorter than 16 chars", srv_warn_err)
+        srv_quiet_err, _ = _serve_short(True)
+        self.assertEqual(srv_quiet_err, "")
+
+        cli_entry = "import sys; from simpyremote.cli import main; sys.exit(main())"
+        sub_env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parent.parent / "src")}
+
+        srv_warn_proc = subprocess.Popen(
+            [sys.executable, "-c", cli_entry, "--server", "127.0.0.1", "--port", "0", "--pre-auth", "short"],
+            env=sub_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            assert srv_warn_proc.stderr is not None
+            warn_line = srv_warn_proc.stderr.readline()
+            self.assertIn("secret is shorter than 16 chars", warn_line)
+        finally:
+            srv_warn_proc.terminate()
+            srv_warn_proc.wait(timeout=5)
+            if srv_warn_proc.stdout is not None:
+                srv_warn_proc.stdout.close()
+            if srv_warn_proc.stderr is not None:
+                srv_warn_proc.stderr.close()
+
+        srv_proc = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                cli_entry,
+                "--server",
+                "127.0.0.1",
+                "--port",
+                "0",
+                "--pre-auth",
+                "short",
+                "--ignore-warnings",
+            ],
+            env=sub_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            assert srv_proc.stderr is not None
+            first_line = srv_proc.stderr.readline()
+            self.assertIn("listening on 127.0.0.1:", first_line)
+            self.assertNotIn("warning:", first_line)
+            short_port = int(first_line.split("127.0.0.1:", 1)[1].split(" ", 1)[0])
+
+            cli_res = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    cli_entry,
+                    "--remote",
+                    f"127.0.0.1:{short_port}",
+                    "--auth",
+                    "short",
+                    "--ignore-warnings",
+                    "--",
+                    sys.executable,
+                    "-c",
+                    "print('ok')",
+                ],
+                env=sub_env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(cli_res.returncode, 0)
+            self.assertEqual(cli_res.stdout.strip(), "ok")
+            self.assertEqual(cli_res.stderr, "")
+        finally:
+            srv_proc.terminate()
+            srv_proc.wait(timeout=5)
+            if srv_proc.stdout is not None:
+                srv_proc.stdout.close()
+            if srv_proc.stderr is not None:
+                srv_proc.stderr.close()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            rc_path = Path(tmp) / ".simpyremote"
+            if os.name == "posix":
+                rc_path.write_text("", encoding="utf-8")
+                os.chmod(rc_path, 0o644)
+
+            old_cfg = os.environ.get("SIMPYREMOTE_CONFIG")
+            old_sec = os.environ.pop("SIMPYREMOTE_SECRET", None)
+            try:
+                os.environ["SIMPYREMOTE_CONFIG"] = str(rc_path)
+
+                for truthy in ("true", "1", "yes", "on"):
+                    rc_path.write_text(
+                        f"addr=127.0.0.1\nport={self.port}\nsecret=short\nignore_warnings={truthy}\n",
+                        encoding="utf-8",
+                    )
+                    err_rc = io.StringIO()
+                    with redirect_stderr(err_rc):
+                        c = Client()
+                    self.assertTrue(c.config.ignore_warnings)
+                    self.assertEqual(err_rc.getvalue(), "")
+
+                err_override = io.StringIO()
+                with redirect_stderr(err_override):
+                    Client(ignore_warnings=False)
+                self.assertIn("secret is shorter than 16 chars", err_override.getvalue())
+                if os.name == "posix":
+                    self.assertIn("readable by group/others", err_override.getvalue())
+
+                for falsy in ("false", "0", "no", "off"):
+                    rc_path.write_text(
+                        f"addr=127.0.0.1\nport={self.port}\nsecret=short\nignore_warnings={falsy}\n",
+                        encoding="utf-8",
+                    )
+                    err_false = io.StringIO()
+                    with redirect_stderr(err_false):
+                        c_false = Client()
+                    self.assertFalse(c_false.config.ignore_warnings)
+                    self.assertIn("secret is shorter than 16 chars", err_false.getvalue())
+
+                err_cli_over = io.StringIO()
+                with redirect_stderr(err_cli_over):
+                    c_cli_over = Client(ignore_warnings=True)
+                self.assertTrue(c_cli_over.config.ignore_warnings)
+                self.assertEqual(err_cli_over.getvalue(), "")
+
+                rc_path.write_text(
+                    "addr=127.0.0.1\nport=2222\nsecret=short\nignore_warnings=maybe\n",
+                    encoding="utf-8",
+                )
+                with self.assertRaises(ValueError):
+                    resolve_client_config()
+
+                if os.name == "posix":
+                    os.environ.pop("SIMPYREMOTE_CONFIG", None)
+                    os.chmod(rc_path, 0o666)
+                    rc_path.write_text(
+                        "addr=127.0.0.1\nport=2222\nsecret=short\nignore_warnings=true\n",
+                        encoding="utf-8",
+                    )
+                    old_cwd = os.getcwd()
+                    old_home = os.environ.get("HOME")
+                    try:
+                        os.environ["HOME"] = str(Path(tmp) / "empty_home")
+                        os.chdir(tmp)
+                        err_untrusted = io.StringIO()
+                        with redirect_stderr(err_untrusted), self.assertRaises(ValueError):
+                            resolve_client_config(ignore_warnings=True)
+                        self.assertIn("ignoring", err_untrusted.getvalue())
+                    finally:
+                        os.chdir(old_cwd)
+                        if old_home is None:
+                            os.environ.pop("HOME", None)
+                        else:
+                            os.environ["HOME"] = old_home
+            finally:
+                if old_cfg is None:
+                    os.environ.pop("SIMPYREMOTE_CONFIG", None)
+                else:
+                    os.environ["SIMPYREMOTE_CONFIG"] = old_cfg
+                if old_sec is not None:
+                    os.environ["SIMPYREMOTE_SECRET"] = old_sec
 
     def test_server_secret_precedence(self) -> None:
         old = os.environ.get("SIMPYREMOTE_SECRET")

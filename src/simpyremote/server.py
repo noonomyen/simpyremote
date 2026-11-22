@@ -469,12 +469,14 @@ def serve(
     *,
     stop_event: threading.Event | None = None,
     on_listening: Any = None,
+    ignore_warnings: bool = False,
 ) -> None:
     """Run the TLS 1.3 PSK remote execution server."""
     if not (0 <= port <= 65535):
         raise ValueError(f"Invalid bind port: {port}")
     secret, generated = resolve_server_secret(pre_auth)
-    warn_if_weak_secret(secret)
+    if not ignore_warnings:
+        warn_if_weak_secret(secret)
     ssl_ctx = build_server_ssl_context(derive_psk(secret))
     sem = threading.BoundedSemaphore(MAX_CONCURRENT_SESSIONS)
 

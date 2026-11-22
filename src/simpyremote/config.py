@@ -20,6 +20,7 @@ class ClientConfig:
     addr: str
     port: int
     secret: str
+    ignore_warnings: bool = False
 
 
 def validate_port(port: int) -> int:
@@ -117,9 +118,23 @@ def _warn_insecure_file_perms(path: Path) -> None:
         pass
 
 
-def load_rc_file(path: Path) -> dict[str, str]:
+def _parse_bool(raw: str, *, key: str) -> bool:
+    norm = raw.strip().lower()
+    if norm in ("1", "true", "yes", "on"):
+        return True
+    if norm in ("0", "false", "no", "off"):
+        return False
+    raise ValueError(f"Invalid boolean value for {key}: {raw!r}")
+
+
+def _extract_rc_ignore_warnings(data: dict[str, str]) -> bool | None:
+    if "ignore_warnings" not in data:
+        return None
+    return _parse_bool(data["ignore_warnings"], key="ignore_warnings")
+
+
+def load_rc_file(path: Path, *, ignore_warnings: bool | None = None) -> dict[str, str]:
     """Parse key=value entries from a .simpyremote file."""
-    _warn_insecure_file_perms(path)
     data: dict[str, str] = {}
     for raw_line in path.read_text(encoding="utf-8").splitlines():
         line = raw_line.strip()
@@ -133,6 +148,10 @@ def load_rc_file(path: Path) -> dict[str, str]:
         if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
             val = val[1:-1]
         data[key] = val
+    rc_ignore = _extract_rc_ignore_warnings(data)
+    effective_ignore = rc_ignore if ignore_warnings is None else bool(ignore_warnings)
+    if not effective_ignore:
+        _warn_insecure_file_perms(path)
     return data
 
 
@@ -140,6 +159,8 @@ def resolve_client_config(
     remote: str | None = None,
     port: int | None = None,
     auth: str | None = None,
+    *,
+    ignore_warnings: bool | None = None,
 ) -> ClientConfig:
     """Resolve client address, port, and secret with CLI > env > .simpyremote precedence."""
     explicit_secret = auth or os.environ.get("SIMPYREMOTE_SECRET")
@@ -147,7 +168,7 @@ def resolve_client_config(
     if not (remote and explicit_secret):
         rc_path = find_config_file()
         if rc_path:
-            rc = load_rc_file(rc_path)
+            rc = load_rc_file(rc_path, ignore_warnings=ignore_warnings)
 
     if remote:
         fallback = validate_port(port) if port is not None else DEFAULT_PORT
@@ -168,7 +189,14 @@ def resolve_client_config(
         raise ValueError(
             "Missing auth secret: pass --auth, set SIMPYREMOTE_SECRET, or configure .simpyremote"
         )
-    return ClientConfig(addr=addr, port=validate_port(final_port), secret=secret)
+    rc_ignore = _extract_rc_ignore_warnings(rc)
+    final_ignore = bool(rc_ignore) if ignore_warnings is None else bool(ignore_warnings)
+    return ClientConfig(
+        addr=addr,
+        port=validate_port(final_port),
+        secret=secret,
+        ignore_warnings=final_ignore,
+    )
 
 
 def resolve_server_secret(pre_auth: str | None = None) -> tuple[str, bool]:

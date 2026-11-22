@@ -75,12 +75,12 @@ from simpyremote import Client, RemoteError, call, pull, push, run, serve
 - `call(fn, *args, **kwargs) -> T`: Executes `fn` in a fresh stateless remote process and returns its JSON-serialized return value. `stdout`/`stderr` still stream live without corrupting the return payload. Remote exceptions raise `RemoteError` (`exc.exc_type`, `exc.remote_traceback`).
 - `push(local_src, remote_dst, *, recursive=False) -> tuple[str, int]`: Streams a file (64 KiB chunks, SHA-256 verified, atomic `os.replace`) or directory (`tarfile` archive verified before extraction with `filter="data"` and strict target-directory scoping). Returns `(saved_remote_path, bytes_transferred)`.
 - `pull(remote_src, local_dst, *, recursive=False) -> tuple[Path, int]`: Downloads a file or directory with the same integrity and path-safety checks. Returns `(saved_local_path, bytes_transferred)`.
-- `serve(host="127.0.0.1", port=2222, pre_auth=None, *, stop_event=None, on_listening=None) -> None`: Starts an embedded server in Python (`port=0` picks an ephemeral port; `on_listening(host, bound_port, secret, was_generated)` fires once listening; set `stop_event` to stop cleanly).
+- `serve(host="127.0.0.1", port=2222, pre_auth=None, *, stop_event=None, on_listening=None, ignore_warnings=False) -> None`: Starts an embedded server in Python (`port=0` picks an ephemeral port; `on_listening(host, bound_port, secret, was_generated)` fires once listening; set `stop_event` to stop cleanly).
 
 Use `Client` when specifying target overrides or advanced options without colliding with `fn`'s `**kwargs`:
 
 ```python
-client = Client(remote="192.168.0.100:2222", auth="example_shared_secret_123456")
+client = Client(remote="192.168.0.100:2222", auth="example_shared_secret_123456", ignore_warnings=False)
 # or Client(remote="192.168.0.100", port=2222, auth="example_shared_secret_123456")
 
 rc = client.run_cmd(["uname", "-a"], cwd="/tmp", pty=False, stdin=..., stdout=..., stderr=...)
@@ -112,9 +112,10 @@ Stream parameters (`stdin`, `stdout`, `stderr`): `stdout` and `stderr` accept bi
 addr=192.168.0.100
 port=2222
 secret=example_shared_secret_123456
+# Optional: ignore_warnings=true
 ```
 
-On POSIX, `./.simpyremote` and `~/.simpyremote` are ignored if owned by another user or writable by group/others (`chmod 666`), while group/other-readable files (`chmod 644`) emit a warning to stderr and still load. Use `chmod 600 .simpyremote`.
+On POSIX, `./.simpyremote` and `~/.simpyremote` are ignored if owned by another user or writable by group/others (`chmod 666`), while group/other-readable files (`chmod 644`) emit a warning to stderr and still load unless `ignore_warnings=true` or `--ignore-warnings` is set (`.simpyremote` is skipped when both `--remote` and `--auth`/`SIMPYREMOTE_SECRET` are supplied). Use `chmod 600 .simpyremote`.
 
 ## Choosing the Right Primitive
 
@@ -186,7 +187,7 @@ When running CLI commands from an agent harness or capturing binary output, pass
 
 - **Auto-generated secret log format (stderr)**: `[simpyremote] listening on <host>:<port> (TLS 1.3 PSK, generated secret=<32-char>)`. Configured secrets print `configured secret` instead of the secret value.
 - **Wrong secret**: Fails during TLS handshake with `[SSL: TLSV1_ALERT_DECRYPT_ERROR]` (exit code `1`), not an application-level message.
-- **Short secret warning**: Secrets shorter than 16 characters emit a warning to stderr on both client and server; use >=16-char (ideally 32-char) secrets to keep stderr clean.
+- **Short secret warning**: Secrets shorter than 16 characters emit a warning to stderr on both client and server; use >=16-char (ideally 32-char) secrets to keep stderr clean, or pass `--ignore-warnings` / set `ignore_warnings=true` in `.simpyremote`.
 
 ## Security & Secret Hygiene
 

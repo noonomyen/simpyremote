@@ -36,28 +36,31 @@ Example `.simpyremote` file:
 addr=192.168.0.100
 port=2222
 secret=your_shared_secret_here
+# Optional: suppress non-fatal warnings (short secret, .simpyremote permissions)
+ignore_warnings=true
 ```
 
-On POSIX systems, `.simpyremote` files owned by another user or writable by group/others are ignored, and files readable by group/others emit a warning recommending `chmod 600`.
+On POSIX systems, `.simpyremote` files owned by another user or writable by group/others are ignored, and files readable by group/others emit a warning recommending `chmod 600` (unless `ignore_warnings=true` or `--ignore-warnings` is set). Note that `.simpyremote` is only consulted when target or secret is omitted (pass `--ignore-warnings` when supplying both `--remote` and `--auth` or `SIMPYREMOTE_SECRET`).
 
 ## CLI Reference
 
 ### Server Mode
 
 ```bash
-simpyremote --server [HOST] [--port PORT] [--pre-auth SECRET]
+simpyremote --server [HOST] [--port PORT] [--pre-auth SECRET] [--ignore-warnings]
 ```
 
 - `--server [HOST]`: Bind host/IP only (never `HOST:PORT`; defaults to `127.0.0.1` if `--server` is passed without a value; use `0.0.0.0` for all IPv4 interfaces or `::` for dual-stack IPv6/IPv4).
 - `--port PORT`: TCP port (`0..65535`, default `2222`; `0` picks an ephemeral OS port).
 - `--pre-auth SECRET`: Pre-shared secret (overrides `SIMPYREMOTE_SECRET`).
+- `--ignore-warnings`: Suppress non-fatal security warnings (short secret, `.simpyremote` permissions).
 
 ### Client Mode
 
 ```bash
-simpyremote [--remote HOST[:PORT]] [--port PORT] [--auth SECRET] [-t | -T] [-- COMMAND [ARGS...]]
-simpyremote [--remote HOST[:PORT]] [--port PORT] [--auth SECRET] [-r] --push LOCAL REMOTE
-simpyremote [--remote HOST[:PORT]] [--port PORT] [--auth SECRET] [-r] --pull REMOTE LOCAL
+simpyremote [--remote HOST[:PORT]] [--port PORT] [--auth SECRET] [--ignore-warnings] [-t | -T] [-- COMMAND [ARGS...]]
+simpyremote [--remote HOST[:PORT]] [--port PORT] [--auth SECRET] [--ignore-warnings] [-r] --push LOCAL REMOTE
+simpyremote [--remote HOST[:PORT]] [--port PORT] [--auth SECRET] [--ignore-warnings] [-r] --pull REMOTE LOCAL
 ```
 
 - `--remote HOST[:PORT]`: Server address (supports IPv4, hostname, and bracketed IPv6 like `[::1]:2222`).
@@ -120,7 +123,7 @@ Use `Client` to specify connection details in code, reuse the derived PSK/SSL co
 import io
 from simpyremote import Client, serve
 
-client = Client(remote="192.168.0.100:2222", auth="example_shared_secret_123456")
+client = Client(remote="192.168.0.100:2222", auth="example_shared_secret_123456", ignore_warnings=False)
 
 # Run an OS command (stdout/stderr accept BytesIO, binary files, StringIO, or TextIOWrapper)
 buf = io.BytesIO()
@@ -138,7 +141,7 @@ remote_path, nbytes = client.push("./folder", "/tmp/dest", recursive=True)
 local_path, nbytes = client.pull("/tmp/dest/folder", "./local_dest", recursive=True)
 
 # Embed a server in Python (port=0 picks an ephemeral port)
-# serve(host="127.0.0.1", port=2222, pre_auth=None, stop_event=ev, on_listening=cb)
+# serve(host="127.0.0.1", port=2222, pre_auth=None, stop_event=ev, on_listening=cb, ignore_warnings=False)
 ```
 
 ### How Function Serialization Works

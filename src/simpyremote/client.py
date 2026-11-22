@@ -6,6 +6,7 @@ import ssl
 import sys
 from collections.abc import Callable
 from contextlib import ExitStack, suppress
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
 
@@ -95,9 +96,19 @@ class Client:
         auth: str | None = None,
         *,
         config: ClientConfig | None = None,
+        ignore_warnings: bool | None = None,
     ) -> None:
-        self.config = config or resolve_client_config(remote=remote, port=port, auth=auth)
-        warn_if_weak_secret(self.config.secret)
+        resolved = config or resolve_client_config(
+            remote=remote,
+            port=port,
+            auth=auth,
+            ignore_warnings=ignore_warnings,
+        )
+        if config is not None and ignore_warnings is not None:
+            resolved = replace(resolved, ignore_warnings=bool(ignore_warnings))
+        self.config = resolved
+        if not self.config.ignore_warnings:
+            warn_if_weak_secret(self.config.secret)
         self._ssl_ctx: ssl.SSLContext | None = None
 
     def _get_ssl_context(self) -> ssl.SSLContext:

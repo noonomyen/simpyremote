@@ -63,6 +63,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Enable recursive directory transfer with --push or --pull",
     )
+    parser.add_argument(
+        "--ignore-warnings",
+        action="store_true",
+        help="Suppress non-fatal security warnings (short secret, .simpyremote permissions)",
+    )
     pty_group = parser.add_mutually_exclusive_group()
     pty_group.add_argument(
         "-t",
@@ -105,7 +110,12 @@ def main(argv: list[str] | None = None) -> int:
         if not (0 <= port <= 65535):
             parser.error(f"invalid --port: {port}")
         try:
-            serve(host=args.server, port=port, pre_auth=args.pre_auth)
+            serve(
+                host=args.server,
+                port=port,
+                pre_auth=args.pre_auth,
+                ignore_warnings=args.ignore_warnings,
+            )
         except (OSError, ValueError, RuntimeError) as exc:
             print(f"[simpyremote] error: {exc}", file=sys.stderr)
             return 1
@@ -128,7 +138,12 @@ def main(argv: list[str] | None = None) -> int:
             parser.error(str(exc))
 
     try:
-        client = Client(remote=args.remote, port=args.port, auth=args.auth)
+        client = Client(
+            remote=args.remote,
+            port=args.port,
+            auth=args.auth,
+            ignore_warnings=True if args.ignore_warnings else None,
+        )
     except (ValueError, OSError, RuntimeError) as exc:
         print(f"[simpyremote] {exc}", file=sys.stderr)
         if cmd_argv is None and not args.push and not args.pull:
