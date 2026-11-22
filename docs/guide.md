@@ -22,7 +22,6 @@ Client connection settings are resolved in strict priority order:
 3. Config file:
    - `SIMPYREMOTE_CONFIG` environment variable (if set; fails if the file does not exist).
    - `./.simpyremote` in the current working directory.
-   - `~/.simpyremote` in the user's home directory.
 
 Server secret resolution order:
 
@@ -66,6 +65,7 @@ simpyremote [--remote HOST[:PORT]] [--port PORT] [--auth SECRET] [--ignore-warni
 - `--remote HOST[:PORT]`: Server address (supports IPv4, hostname, and bracketed IPv6 like `[::1]:2222`).
 - `--port PORT`: Port override (`1..65535`).
 - `--auth SECRET`: Authentication secret override.
+- `--ignore-warnings`: Suppress non-fatal security warnings (short secret, `.simpyremote` permissions).
 - `-t` / `--pty`: Force pseudo-terminal allocation.
 - `-T` / `--no-pty`: Disable pseudo-terminal allocation and force raw pipes.
 - `-- COMMAND [ARGS...]`: `--` is mandatory before any remote command; everything after the first `--` is forwarded verbatim as the remote command argv. If omitted (and neither `--push` nor `--pull` is given), the server opens its default shell (`$SHELL` / `/bin/sh` on POSIX, `powershell.exe -NoLogo` / `cmd.exe` on Windows).
@@ -123,7 +123,7 @@ Use `Client` to specify connection details in code, reuse the derived PSK/SSL co
 import io
 from simpyremote import Client, serve
 
-client = Client(remote="192.168.0.100:2222", auth="example_shared_secret_123456", ignore_warnings=False)
+client = Client(remote="192.168.0.100:2222", auth="example_shared_secret_123456", ignore_warnings=None)
 
 # Run an OS command (stdout/stderr accept BytesIO, binary files, StringIO, or TextIOWrapper)
 buf = io.BytesIO()

@@ -80,7 +80,7 @@ from simpyremote import Client, RemoteError, call, pull, push, run, serve
 Use `Client` when specifying target overrides or advanced options without colliding with `fn`'s `**kwargs`:
 
 ```python
-client = Client(remote="192.168.0.100:2222", auth="example_shared_secret_123456", ignore_warnings=False)
+client = Client(remote="192.168.0.100:2222", auth="example_shared_secret_123456", ignore_warnings=None)
 # or Client(remote="192.168.0.100", port=2222, auth="example_shared_secret_123456")
 
 rc = client.run_cmd(["uname", "-a"], cwd="/tmp", pty=False, stdin=..., stdout=..., stderr=...)
@@ -103,7 +103,7 @@ Stream parameters (`stdin`, `stdout`, `stderr`): `stdout` and `stderr` accept bi
 
 ## Configuration Precedence
 
-- **Client**: CLI flags (`--remote`, `--port`, `--auth`) > `SIMPYREMOTE_SECRET` env var > config file (`SIMPYREMOTE_CONFIG` env var, else trusted `./.simpyremote`, else trusted `~/.simpyremote`).
+- **Client**: CLI flags (`--remote`, `--port`, `--auth`) > `SIMPYREMOTE_SECRET` env var > config file (`SIMPYREMOTE_CONFIG` env var, else trusted `./.simpyremote`).
 - **Server**: `--pre-auth` > `SIMPYREMOTE_SECRET` > auto-generated 32-char `[A-Za-z0-9]` secret (printed to stderr only when auto-generated; configured secrets are redacted in logs).
 
 `.simpyremote` format:
@@ -115,7 +115,7 @@ secret=example_shared_secret_123456
 # Optional: ignore_warnings=true
 ```
 
-On POSIX, `./.simpyremote` and `~/.simpyremote` are ignored if owned by another user or writable by group/others (`chmod 666`), while group/other-readable files (`chmod 644`) emit a warning to stderr and still load unless `ignore_warnings=true` or `--ignore-warnings` is set (`.simpyremote` is skipped when both `--remote` and `--auth`/`SIMPYREMOTE_SECRET` are supplied). Use `chmod 600 .simpyremote`.
+On POSIX, `./.simpyremote` is ignored if owned by another user or writable by group/others (`chmod 666`), while group/other-readable files (`chmod 644`) emit a warning to stderr and still load unless `ignore_warnings=true` or `--ignore-warnings` is set (`.simpyremote` is skipped when both `--remote` and `--auth`/`SIMPYREMOTE_SECRET` are supplied). Use `chmod 600 .simpyremote`.
 
 ## Choosing the Right Primitive
 

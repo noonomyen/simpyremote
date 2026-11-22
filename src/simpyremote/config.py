@@ -85,7 +85,7 @@ def _is_trusted_rc_file(path: Path) -> bool:
 
 
 def find_config_file() -> Path | None:
-    """Locate .simpyremote from env override, trusted CWD, or user home."""
+    """Locate .simpyremote from env override or trusted current working directory."""
     env_path = os.environ.get("SIMPYREMOTE_CONFIG")
     if env_path:
         p = Path(env_path).expanduser()
@@ -95,12 +95,6 @@ def find_config_file() -> Path | None:
     cwd_candidate = Path.cwd() / RC_FILENAME
     if cwd_candidate.is_file() and _is_trusted_rc_file(cwd_candidate):
         return cwd_candidate
-    try:
-        home_candidate = Path.home() / RC_FILENAME
-    except RuntimeError:
-        return None
-    if home_candidate.is_file() and _is_trusted_rc_file(home_candidate):
-        return home_candidate
     return None
 
 

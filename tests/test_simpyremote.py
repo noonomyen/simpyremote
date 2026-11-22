@@ -140,9 +140,7 @@ class SimpyRemoteTests(unittest.TestCase):
             old_cwd = os.getcwd()
             old_env = os.environ.pop("SIMPYREMOTE_SECRET", None)
             old_cfg = os.environ.pop("SIMPYREMOTE_CONFIG", None)
-            old_home = os.environ.get("HOME")
             try:
-                os.environ["HOME"] = str(Path(tmp) / "empty_home")
                 os.chdir(tmp)
                 cfg = resolve_client_config()
                 self.assertEqual(
@@ -162,10 +160,6 @@ class SimpyRemoteTests(unittest.TestCase):
                         resolve_client_config()
             finally:
                 os.chdir(old_cwd)
-                if old_home is None:
-                    os.environ.pop("HOME", None)
-                else:
-                    os.environ["HOME"] = old_home
                 if old_env is not None:
                     os.environ["SIMPYREMOTE_SECRET"] = old_env
                 if old_cfg is not None:
@@ -362,9 +356,7 @@ class SimpyRemoteTests(unittest.TestCase):
                         encoding="utf-8",
                     )
                     old_cwd = os.getcwd()
-                    old_home = os.environ.get("HOME")
                     try:
-                        os.environ["HOME"] = str(Path(tmp) / "empty_home")
                         os.chdir(tmp)
                         err_untrusted = io.StringIO()
                         with redirect_stderr(err_untrusted), self.assertRaises(ValueError):
@@ -372,10 +364,6 @@ class SimpyRemoteTests(unittest.TestCase):
                         self.assertIn("ignoring", err_untrusted.getvalue())
                     finally:
                         os.chdir(old_cwd)
-                        if old_home is None:
-                            os.environ.pop("HOME", None)
-                        else:
-                            os.environ["HOME"] = old_home
             finally:
                 if old_cfg is None:
                     os.environ.pop("SIMPYREMOTE_CONFIG", None)

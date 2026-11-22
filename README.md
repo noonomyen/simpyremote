@@ -27,15 +27,15 @@ On the target machine:
 # Auto-generate a random 32-character secret
 simpyremote --server 0.0.0.0 --port 2222
 
-# Or set your own secret (pass --ignore-warnings to suppress short-secret warnings)
+# Or set your own secret
 SIMPYREMOTE_SECRET=mysecret simpyremote --server 0.0.0.0 --port 2222
-# or
+# Or pass secret via flag (add --ignore-warnings to suppress short-secret warnings)
 simpyremote --server 0.0.0.0 --port 2222 --pre-auth mysecret --ignore-warnings
 ```
 
 ### 2. Configure Client (`.simpyremote`)
 
-Optionally save your connection details in `./.simpyremote` or `~/.simpyremote`:
+Optionally save your connection details in `./.simpyremote`:
 
 ```ini
 addr=192.168.0.100
