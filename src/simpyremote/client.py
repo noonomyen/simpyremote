@@ -141,7 +141,7 @@ def SHELL_AUTO(cmd: str) -> int:
         if ps:
             encoded = base64.b64encode((cmd or " ").encode("utf-16le")).decode("ascii")
             return subprocess.run(
-                [ps, "-NoLogo", "-NoProfile", "-EncodedCommand", encoded],
+                [ps, "-NoLogo", "-NoProfile", "-OutputFormat", "Text", "-EncodedCommand", encoded],
                 env=env,
             ).returncode
         if "\n" in cmd or "\r" in cmd:
@@ -219,7 +219,7 @@ def SHELL_PWSH(cmd: str) -> int:
     pwsh = shutil.which("pwsh") or "pwsh"
     encoded = base64.b64encode((cmd or " ").encode("utf-16le")).decode("ascii")
     return subprocess.run(
-        [pwsh, "-NoLogo", "-NoProfile", "-EncodedCommand", encoded],
+        [pwsh, "-NoLogo", "-NoProfile", "-OutputFormat", "Text", "-EncodedCommand", encoded],
         env=env,
     ).returncode
 
@@ -244,7 +244,7 @@ def SHELL_POWERSHELL(cmd: str) -> int:
     ps = shutil.which("powershell.exe") or "powershell.exe"
     encoded = base64.b64encode((cmd or " ").encode("utf-16le")).decode("ascii")
     return subprocess.run(
-        [ps, "-NoLogo", "-NoProfile", "-EncodedCommand", encoded],
+        [ps, "-NoLogo", "-NoProfile", "-OutputFormat", "Text", "-EncodedCommand", encoded],
         env=env,
     ).returncode
 

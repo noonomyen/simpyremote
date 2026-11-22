@@ -688,7 +688,10 @@ class SimpyRemoteTests(unittest.TestCase):
                 )
                 self.assertEqual(rc_pw, 0)
                 parsed_pw = json.loads(out_pw.strip())
-                self.assertEqual(parsed_pw["flags"], ["-NoLogo", "-NoProfile", "-EncodedCommand"])
+                self.assertEqual(
+                    parsed_pw["flags"],
+                    ["-NoLogo", "-NoProfile", "-OutputFormat", "Text", "-EncodedCommand"],
+                )
                 self.assertEqual(parsed_pw["cmd"], 'Write-Output "hello \'quotes\'"\nexit 0')
 
                 rc_pw_empty, out_pw_empty, _ = self.client.capture_shell("", shell=SHELL_PWSH)
@@ -919,7 +922,21 @@ class SimpyRemoteTests(unittest.TestCase):
         rc_cap, cap_out, cap_err = self.client.capture_shell("echo cap-ok")
         self.assertEqual(rc_cap, 0)
         self.assertEqual(cap_out.strip(), "cap-ok")
-        self.assertEqual(cap_err, "")
+        if os.name == "posix" or _is_wine():
+            self.assertEqual(cap_err, "")
+        else:
+            if cap_err:
+                self.assertTrue(cap_err.lstrip().startswith("#< CLIXML"), cap_err)
+            self.assertNotIn("cap-ok", cap_err)
+
+        if sys.platform == "win32":
+            rc_cmd_cap, cmd_cap_out, cmd_cap_err = self.client.capture_shell(
+                "echo cap-cmd-ok",
+                shell=SHELL_CMD,
+            )
+            self.assertEqual(rc_cmd_cap, 0)
+            self.assertEqual(cmd_cap_out.strip(), "cap-cmd-ok")
+            self.assertEqual(cmd_cap_err, "")
 
         rc_ex, ex_out, ex_err = self.client.capture_exec(
             [
