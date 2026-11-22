@@ -10,7 +10,7 @@ import tempfile
 import threading
 from contextlib import suppress
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Any
+from typing import Any, NoReturn
 
 from .proto import (
     FRAME_ERROR,
@@ -18,13 +18,33 @@ from .proto import (
     FRAME_FILE_DONE,
     FRAME_FILE_GET,
     FRAME_FILE_PUT,
-    decode_error_payload,
     recv_frame,
     send_frame,
     send_json,
 )
 
 TRANSFER_CHUNK_SIZE = 65536
+
+_TRANSFER_ERROR_MAP: dict[str, type[Exception]] = {
+    "FileNotFoundError": FileNotFoundError,
+    "IsADirectoryError": IsADirectoryError,
+    "NotADirectoryError": NotADirectoryError,
+    "PermissionError": PermissionError,
+    "ValueError": ValueError,
+}
+
+
+def _raise_transfer_error(payload: bytes) -> NoReturn:
+    text = payload.decode("utf-8", errors="replace")
+    try:
+        parsed = json.loads(text)
+    except ValueError:
+        raise RuntimeError(text) from None
+    if isinstance(parsed, dict):
+        msg = str(parsed.get("error", text))
+        exc_cls = _TRANSFER_ERROR_MAP.get(str(parsed.get("exc_type", "")), RuntimeError)
+        raise exc_cls(msg)
+    raise RuntimeError(text)
 
 
 class _FrameChunkWriter(io.RawIOBase):
@@ -211,7 +231,7 @@ def _receive_stream_to_dest(
                         )
                     break
                 elif msg_type == FRAME_ERROR:
-                    raise RuntimeError(decode_error_payload(payload))
+                    _raise_transfer_error(payload)
                 else:
                     raise RuntimeError(f"Unexpected frame type during transfer: {msg_type}")
 
@@ -242,6 +262,8 @@ def client_push(
     recursive: bool = False,
 ) -> tuple[str, int]:
     """Upload a local file or directory to the remote server."""
+    if not isinstance(remote_dst, str):
+        raise TypeError(f"remote_dst must be a remote path str, got {type(remote_dst).__name__}")
     src_path = Path(local_src).expanduser().resolve()
     if not src_path.exists():
         raise FileNotFoundError(f"Local path not found: {src_path}")
@@ -265,7 +287,7 @@ def client_push(
     if ready is None:
         raise EOFError("Server closed connection before accepting upload")
     if ready[0] == FRAME_ERROR:
-        raise RuntimeError(decode_error_payload(ready[1]))
+        _raise_transfer_error(ready[1])
     if ready[0] != FRAME_FILE_PUT:
         raise RuntimeError(f"Unexpected server reply before upload: {ready[0]}")
 
@@ -277,7 +299,7 @@ def client_push(
         raise EOFError("Server closed connection before acknowledging upload")
     msg_type, payload = reply
     if msg_type == FRAME_ERROR:
-        raise RuntimeError(decode_error_payload(payload))
+        _raise_transfer_error(payload)
     if msg_type != FRAME_FILE_DONE:
         raise RuntimeError(f"Unexpected server reply: {msg_type}")
     ack = json.loads(payload.decode("utf-8"))
@@ -292,6 +314,8 @@ def client_pull(
     recursive: bool = False,
 ) -> tuple[Path, int]:
     """Download a remote file or directory from the server."""
+    if not isinstance(remote_src, str):
+        raise TypeError(f"remote_src must be a remote path str, got {type(remote_src).__name__}")
     send_json(
         sock,
         FRAME_FILE_GET,
@@ -302,7 +326,7 @@ def client_pull(
         raise EOFError("Server closed connection before sending file metadata")
     msg_type, payload = first
     if msg_type == FRAME_ERROR:
-        raise RuntimeError(decode_error_payload(payload))
+        _raise_transfer_error(payload)
     if msg_type != FRAME_FILE_GET:
         raise RuntimeError(f"Unexpected server reply: {msg_type}")
     meta = json.loads(payload.decode("utf-8"))
@@ -318,7 +342,7 @@ def server_handle_file_put(sock: socket.socket, meta: dict[str, Any]) -> None:
         send_json(sock, FRAME_FILE_DONE, {"path": str(saved_path), "size": received})
     except Exception as exc:
         with suppress(OSError):
-            send_json(sock, FRAME_ERROR, {"error": str(exc)})
+            send_json(sock, FRAME_ERROR, {"error": str(exc), "exc_type": type(exc).__name__})
 
 
 def server_handle_file_get(sock: socket.socket, req: dict[str, Any]) -> None:
@@ -344,4 +368,4 @@ def server_handle_file_get(sock: socket.socket, req: dict[str, Any]) -> None:
         send_json(sock, FRAME_FILE_DONE, {"size": total, "sha256": sha256_hex})
     except Exception as exc:
         with suppress(OSError):
-            send_json(sock, FRAME_ERROR, {"error": str(exc)})
+            send_json(sock, FRAME_ERROR, {"error": str(exc), "exc_type": type(exc).__name__})

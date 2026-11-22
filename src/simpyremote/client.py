@@ -3,8 +3,9 @@ import io
 import json
 import os
 import ssl
+import subprocess
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from contextlib import ExitStack, suppress
 from dataclasses import replace
 from pathlib import Path
@@ -37,6 +38,247 @@ from .serialize import RemoteError, decode_data, serialize_callable
 from .tls import build_client_ssl_context, connect_tls, derive_psk, warn_if_weak_secret
 from .transfer import client_pull, client_push
 
+DEVNULL = subprocess.DEVNULL
+
+
+def _is_devnull(stream: Any) -> bool:
+    return stream is False or (
+        isinstance(stream, int)
+        and not isinstance(stream, bool)
+        and stream == subprocess.DEVNULL
+    )
+
+
+def _normalize_stdin(stdin: Any) -> tuple[Any, bool]:
+    if _is_devnull(stdin):
+        return None, False
+    if stdin is None:
+        return sys.stdin, True
+    if isinstance(stdin, (bytes, bytearray, memoryview)):
+        return io.BytesIO(bytes(stdin)), True
+    if isinstance(stdin, str):
+        return io.BytesIO(stdin.encode("utf-8")), True
+    if hasattr(stdin, "read"):
+        if getattr(stdin, "closed", False):
+            return None, False
+        readable = getattr(stdin, "readable", None)
+        if callable(readable):
+            try:
+                if not readable():
+                    raise TypeError("stdin stream must be readable")
+            except ValueError:
+                return None, False
+        return stdin, True
+    raise TypeError(
+        f"stdin must be None, DEVNULL, False, bytes, str, or a readable stream, got {type(stdin).__name__}"
+    )
+
+
+def _normalize_cwd(cwd: str | None) -> str | None:
+    if cwd is not None and not isinstance(cwd, str):
+        raise TypeError(f"cwd must be a remote path str or None, got {type(cwd).__name__}")
+    return cwd
+
+
+def _normalize_output_stream(stream: Any, name: str, default: Any) -> Any:
+    if _is_devnull(stream):
+        return None
+    if stream is None:
+        return default
+    if hasattr(stream, "write"):
+        return stream
+    raise TypeError(
+        f"{name} must be None, DEVNULL, False, or a writable stream, got {type(stream).__name__}"
+    )
+
+
+def _exec_runner(argv: list[str]) -> int:
+    import os
+    import subprocess
+    import sys
+
+    env = None
+    if getattr(sys, "frozen", False) and sys.platform != "win32":
+        env = os.environ.copy()
+        orig = env.pop("LD_LIBRARY_PATH_ORIG", None)
+        if orig is not None:
+            env["LD_LIBRARY_PATH"] = orig
+        else:
+            env.pop("LD_LIBRARY_PATH", None)
+    return subprocess.run(argv, env=env).returncode
+
+
+def SHELL_AUTO(cmd: str) -> int:
+    """Detect the remote OS shell and execute cmd."""
+    import base64
+    import os
+    import shutil
+    import subprocess
+    import sys
+
+    env = None
+    if getattr(sys, "frozen", False) and sys.platform != "win32":
+        env = os.environ.copy()
+        orig = env.pop("LD_LIBRARY_PATH_ORIG", None)
+        if orig is not None:
+            env["LD_LIBRARY_PATH"] = orig
+        else:
+            env.pop("LD_LIBRARY_PATH", None)
+
+    if sys.platform == "win32":
+        is_wine = False
+        try:
+            import ctypes
+
+            is_wine = hasattr(ctypes.WinDLL("ntdll"), "wine_get_version")
+        except OSError:
+            pass
+        ps = (
+            shutil.which("pwsh")
+            if is_wine
+            else (shutil.which("powershell.exe") or shutil.which("pwsh"))
+        )
+        if ps:
+            encoded = base64.b64encode((cmd or " ").encode("utf-16le")).decode("ascii")
+            return subprocess.run(
+                [ps, "-NoLogo", "-NoProfile", "-EncodedCommand", encoded],
+                env=env,
+            ).returncode
+        if "\n" in cmd or "\r" in cmd:
+            raise ValueError(
+                "cmd.exe only supports single-line commands; install PowerShell for multiline scripts"
+            )
+        comspec = (os.environ.get("COMSPEC") or "cmd.exe").strip('"')
+        return subprocess.run(f'"{comspec}" /d /s /c "{cmd}"', env=env).returncode
+
+    posix_shells = {"sh", "bash", "dash", "ash", "zsh", "ksh", "mksh"}
+    env_shell = os.environ.get("SHELL", "")
+    if env_shell and os.path.basename(env_shell) in posix_shells and shutil.which(env_shell):
+        return subprocess.run([env_shell, "-c", cmd], env=env).returncode
+    sh = shutil.which("sh") or "/bin/sh"
+    return subprocess.run([sh, "-c", cmd], env=env).returncode
+
+
+def SHELL_SH(cmd: str) -> int:
+    """Execute cmd via POSIX sh -c."""
+    import os
+    import shutil
+    import subprocess
+    import sys
+
+    env = None
+    if getattr(sys, "frozen", False) and sys.platform != "win32":
+        env = os.environ.copy()
+        orig = env.pop("LD_LIBRARY_PATH_ORIG", None)
+        if orig is not None:
+            env["LD_LIBRARY_PATH"] = orig
+        else:
+            env.pop("LD_LIBRARY_PATH", None)
+
+    sh = shutil.which("sh") or ("sh" if sys.platform == "win32" else "/bin/sh")
+    return subprocess.run([sh, "-c", cmd], env=env).returncode
+
+
+def SHELL_BASH(cmd: str) -> int:
+    """Execute cmd via bash -c."""
+    import os
+    import shutil
+    import subprocess
+    import sys
+
+    env = None
+    if getattr(sys, "frozen", False) and sys.platform != "win32":
+        env = os.environ.copy()
+        orig = env.pop("LD_LIBRARY_PATH_ORIG", None)
+        if orig is not None:
+            env["LD_LIBRARY_PATH"] = orig
+        else:
+            env.pop("LD_LIBRARY_PATH", None)
+
+    bash = shutil.which("bash") or "bash"
+    return subprocess.run([bash, "-c", cmd], env=env).returncode
+
+
+def SHELL_PWSH(cmd: str) -> int:
+    """Execute cmd via PowerShell Core (pwsh) using -EncodedCommand."""
+    import base64
+    import os
+    import shutil
+    import subprocess
+    import sys
+
+    env = None
+    if getattr(sys, "frozen", False) and sys.platform != "win32":
+        env = os.environ.copy()
+        orig = env.pop("LD_LIBRARY_PATH_ORIG", None)
+        if orig is not None:
+            env["LD_LIBRARY_PATH"] = orig
+        else:
+            env.pop("LD_LIBRARY_PATH", None)
+
+    pwsh = shutil.which("pwsh") or "pwsh"
+    encoded = base64.b64encode((cmd or " ").encode("utf-16le")).decode("ascii")
+    return subprocess.run(
+        [pwsh, "-NoLogo", "-NoProfile", "-EncodedCommand", encoded],
+        env=env,
+    ).returncode
+
+
+def SHELL_POWERSHELL(cmd: str) -> int:
+    """Execute cmd via Windows PowerShell using -EncodedCommand."""
+    import base64
+    import os
+    import shutil
+    import subprocess
+    import sys
+
+    env = None
+    if getattr(sys, "frozen", False) and sys.platform != "win32":
+        env = os.environ.copy()
+        orig = env.pop("LD_LIBRARY_PATH_ORIG", None)
+        if orig is not None:
+            env["LD_LIBRARY_PATH"] = orig
+        else:
+            env.pop("LD_LIBRARY_PATH", None)
+
+    ps = shutil.which("powershell.exe") or "powershell.exe"
+    encoded = base64.b64encode((cmd or " ").encode("utf-16le")).decode("ascii")
+    return subprocess.run(
+        [ps, "-NoLogo", "-NoProfile", "-EncodedCommand", encoded],
+        env=env,
+    ).returncode
+
+
+def SHELL_CMD(cmd: str) -> int:
+    """Execute cmd via Windows cmd.exe."""
+    import os
+    import subprocess
+    import sys
+
+    env = None
+    if getattr(sys, "frozen", False) and sys.platform != "win32":
+        env = os.environ.copy()
+        orig = env.pop("LD_LIBRARY_PATH_ORIG", None)
+        if orig is not None:
+            env["LD_LIBRARY_PATH"] = orig
+        else:
+            env.pop("LD_LIBRARY_PATH", None)
+
+    comspec = (os.environ.get("COMSPEC") or "cmd.exe").strip('"')
+    if sys.platform == "win32":
+        if "\n" in cmd or "\r" in cmd:
+            raise ValueError(
+                "SHELL_CMD only supports single-line commands; use SHELL_POWERSHELL or SHELL_PWSH"
+            )
+        return subprocess.run(f'"{comspec}" /d /s /c "{cmd}"', env=env).returncode
+    return subprocess.run([comspec, "/d", "/c", cmd], env=env).returncode
+
+
+def _flush_if_present(target: Any) -> None:
+    flush = getattr(target, "flush", None)
+    if callable(flush):
+        flush()
+
 
 def _write_stream(
     stream: Any,
@@ -47,8 +289,9 @@ def _write_stream(
         return
     buf = getattr(stream, "buffer", None)
     if buf is not None:
+        _flush_if_present(stream)
         buf.write(data)
-        buf.flush()
+        _flush_if_present(buf)
         return
     if isinstance(stream, io.RawIOBase):
         view = memoryview(data)
@@ -57,11 +300,11 @@ def _write_stream(
             if written is None or written <= 0:
                 break
             view = view[written:]
-        stream.flush()
+        _flush_if_present(stream)
         return
     if isinstance(stream, io.BufferedIOBase) or "b" in str(getattr(stream, "mode", "")):
         stream.write(data)
-        stream.flush()
+        _flush_if_present(stream)
         return
     text = (
         decoder.decode(data)
@@ -70,7 +313,7 @@ def _write_stream(
     )
     if text:
         stream.write(text)
-        stream.flush()
+        _flush_if_present(stream)
 
 
 def _flush_text_decoder(stream: Any, decoder: codecs.IncrementalDecoder) -> None:
@@ -83,7 +326,7 @@ def _flush_text_decoder(stream: Any, decoder: codecs.IncrementalDecoder) -> None
     tail = decoder.decode(b"", final=True)
     if tail:
         stream.write(tail)
-        stream.flush()
+        _flush_if_present(stream)
 
 
 class Client:
@@ -130,9 +373,10 @@ class Client:
         stdout: Any = None,
         stderr: Any = None,
     ) -> tuple[int, dict[str, Any] | None]:
-        in_stream = sys.stdin if stdin is None else stdin
-        out_stream = sys.stdout if stdout is None else stdout
-        err_stream = sys.stderr if stderr is None else stderr
+        in_stream, stdin_enabled = _normalize_stdin(stdin)
+        out_stream = _normalize_output_stream(stdout, "stdout", sys.stdout)
+        err_stream = _normalize_output_stream(stderr, "stderr", sys.stderr)
+        effective_forward_stdin = bool(forward_stdin) and stdin_enabled
         out_decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         err_decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
 
@@ -148,7 +392,7 @@ class Client:
 
         def _start_stdin_pump(pty_active: bool) -> None:
             nonlocal stdin_pump
-            if forward_stdin and stdin_pump is None:
+            if effective_forward_stdin and stdin_pump is None:
                 pump = StdinForwarder(session, stdin_stream=in_stream, pty_mode=pty_active)
                 pump.start()
                 stdin_pump = pump
@@ -183,12 +427,13 @@ class Client:
                 info = json.loads(payload.decode("utf-8"))
                 remote_pid = int(info["pid"])
                 pty_active = bool(info.get("pty", False))
-                if pty_active:
+                if pty_active and effective_forward_stdin:
                     stack.enter_context(raw_terminal_mode(in_stream, out_stream))
                     stack.enter_context(
                         winch_guard(lambda: session.enqueue_urgent("RESIZE"))
                     )
-                _start_stdin_pump(pty_active)
+                if effective_forward_stdin:
+                    _start_stdin_pump(pty_active)
             elif msg_type == FRAME_STDOUT:
                 _write_stream(out_stream, payload, out_decoder)
             elif msg_type == FRAME_STDERR:
@@ -218,23 +463,26 @@ class Client:
                         lambda: session.enqueue_urgent("DETACH"),
                     )
                 )
-                if forward_stdin and not request_pty:
+                if effective_forward_stdin and not request_pty:
                     _start_stdin_pump(False)
                 session.run(_on_frame, on_eof=_on_eof, on_urgent=_on_urgent)
 
-            _flush_text_decoder(out_stream, out_decoder)
-            _flush_text_decoder(err_stream, err_decoder)
             if detached:
                 pid_hint = f" (remote pid={remote_pid})" if remote_pid is not None else ""
                 _write_stream(
                     err_stream,
                     f"\n[simpyremote] detaching client{pid_hint}\n".encode(),
+                    err_decoder,
                 )
                 return 130, None
             if not got_exit:
                 raise EOFError("Remote server closed connection unexpectedly")
             return exit_code, return_payload
         finally:
+            with suppress(Exception):
+                _flush_text_decoder(out_stream, out_decoder)
+            with suppress(Exception):
+                _flush_text_decoder(err_stream, err_decoder)
             session.closed.set()
             stack.close()
             session.close()
@@ -243,27 +491,40 @@ class Client:
 
     def run_cmd(
         self,
-        argv: list[str] | None = None,
+        argv: Sequence[str] | None = None,
         *,
         cwd: str | None = None,
         pty: bool | None = None,
         stdin: Any = None,
         stdout: Any = None,
         stderr: Any = None,
+        forward_stdin: bool = True,
     ) -> int:
         """Execute a remote command (or server's default shell if argv is None)."""
-        in_stream = sys.stdin if stdin is None else stdin
-        out_stream = sys.stdout if stdout is None else stdout
+        if argv is not None and (
+            isinstance(argv, (str, bytes, bytearray, memoryview))
+            or not isinstance(argv, Sequence)
+        ):
+            raise TypeError("argv must be None or a sequence of strings, not str or bytes")
+        cwd = _normalize_cwd(cwd)
+        in_stream, stdin_enabled = _normalize_stdin(stdin)
+        out_stream = _normalize_output_stream(stdout, "stdout", sys.stdout)
+        _normalize_output_stream(stderr, "stderr", sys.stderr)
         use_pty = (
-            stream_is_tty(in_stream) and stream_is_tty(out_stream)
+            bool(forward_stdin)
+            and stdin_enabled
+            and stream_is_tty(in_stream)
+            and stream_is_tty(out_stream)
             if pty is None
             else bool(pty)
         )
         req: dict[str, Any] = {
-            "argv": list(argv) if argv else [],
+            "argv": [str(x) for x in argv] if argv else [],
             "cwd": cwd,
             "pty": use_pty,
         }
+        if not (bool(forward_stdin) and stdin_enabled):
+            req["close_stdin"] = True
         if use_pty:
             cols, rows = terminal_size()
             req["cols"] = cols
@@ -272,49 +533,114 @@ class Client:
         rc, _ = self._stream_session(
             FRAME_EXEC_CMD,
             req,
-            forward_stdin=True,
+            forward_stdin=forward_stdin,
             request_pty=use_pty,
-            stdin=stdin,
+            stdin=in_stream if stdin_enabled else False,
             stdout=stdout,
             stderr=stderr,
         )
         return rc
 
-    def run(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> int:
-        """Serialize fn and run it in a remote process with attached stdio, returning exit code."""
-        return self.run_with(fn, args=args, kwargs=kwargs)
-
-    def run_with(
+    def run_shell(
         self,
-        fn: Callable[..., Any],
+        cmd: str,
         *,
-        args: tuple[Any, ...] = (),
-        kwargs: dict[str, Any] | None = None,
-        serializer: str = "json",
+        shell: Callable[[str], Any] | None = None,
         cwd: str | None = None,
         stdin: Any = None,
         stdout: Any = None,
         stderr: Any = None,
+        forward_stdin: bool = True,
     ) -> int:
-        """Execute fn in a remote process with explicit stdio and serializer options."""
-        job = serialize_callable(
-            fn,
-            args,
-            kwargs or {},
-            mode="run",
-            serializer=serializer,
-        )
-        if cwd is not None:
-            job["cwd"] = cwd
-        rc, _ = self._stream_session(
-            FRAME_EXEC_PY,
-            job,
-            forward_stdin=True,
+        """Execute a shell command string on the remote host via the call protocol."""
+        if not isinstance(cmd, str):
+            raise TypeError(f"cmd must be str, got {type(cmd).__name__}")
+        runner = SHELL_AUTO if shell is None else shell
+        if not callable(runner):
+            raise TypeError(f"shell must be callable or None, got {type(runner).__name__}")
+        rc = self.call_with(
+            runner,
+            args=(cmd,),
+            cwd=cwd,
             stdin=stdin,
             stdout=stdout,
             stderr=stderr,
+            forward_stdin=forward_stdin,
         )
-        return rc
+        return 0 if rc is None else int(rc)
+
+    def run_exec(
+        self,
+        argv: Sequence[str],
+        *,
+        cwd: str | None = None,
+        stdin: Any = None,
+        stdout: Any = None,
+        stderr: Any = None,
+        forward_stdin: bool = True,
+    ) -> int:
+        """Execute an argv sequence directly without a shell via the call protocol."""
+        if isinstance(argv, (str, bytes, bytearray, memoryview)) or not isinstance(
+            argv, Sequence
+        ):
+            raise TypeError("argv must be a sequence of strings, not str or bytes")
+        argv_list = [str(x) for x in argv]
+        if not argv_list:
+            raise ValueError("argv must not be empty")
+        rc = self.call_with(
+            _exec_runner,
+            args=(argv_list,),
+            cwd=cwd,
+            stdin=stdin,
+            stdout=stdout,
+            stderr=stderr,
+            forward_stdin=forward_stdin,
+        )
+        return 0 if rc is None else int(rc)
+
+    def capture_shell(
+        self,
+        cmd: str,
+        *,
+        shell: Callable[[str], Any] | None = None,
+        cwd: str | None = None,
+        stdin: Any = DEVNULL,
+        forward_stdin: bool = True,
+    ) -> tuple[int, str, str]:
+        """Run a shell command and return (returncode, stdout_text, stderr_text)."""
+        out_buf = io.StringIO()
+        err_buf = io.StringIO()
+        rc = self.run_shell(
+            cmd,
+            shell=shell,
+            cwd=cwd,
+            stdin=stdin,
+            stdout=out_buf,
+            stderr=err_buf,
+            forward_stdin=forward_stdin,
+        )
+        return rc, out_buf.getvalue(), err_buf.getvalue()
+
+    def capture_exec(
+        self,
+        argv: Sequence[str],
+        *,
+        cwd: str | None = None,
+        stdin: Any = DEVNULL,
+        forward_stdin: bool = True,
+    ) -> tuple[int, str, str]:
+        """Execute an argv sequence directly and return (returncode, stdout_text, stderr_text)."""
+        out_buf = io.StringIO()
+        err_buf = io.StringIO()
+        rc = self.run_exec(
+            argv,
+            cwd=cwd,
+            stdin=stdin,
+            stdout=out_buf,
+            stderr=err_buf,
+            forward_stdin=forward_stdin,
+        )
+        return rc, out_buf.getvalue(), err_buf.getvalue()
 
     def call[T](
         self,
@@ -332,13 +658,22 @@ class Client:
         args: tuple[Any, ...] = (),
         kwargs: dict[str, Any] | None = None,
         serializer: str = "json",
-        forward_stdin: bool = False,
+        forward_stdin: bool | None = None,
         cwd: str | None = None,
         stdin: Any = None,
         stdout: Any = None,
         stderr: Any = None,
     ) -> T:
         """Execute fn in a fresh remote process with explicit RPC options."""
+        cwd = _normalize_cwd(cwd)
+        in_stream, stdin_enabled = _normalize_stdin(stdin)
+        _normalize_output_stream(stdout, "stdout", sys.stdout)
+        _normalize_output_stream(stderr, "stderr", sys.stderr)
+        effective_forward_stdin = (
+            stdin is not None and stdin_enabled
+            if forward_stdin is None
+            else bool(forward_stdin) and stdin_enabled
+        )
         job = serialize_callable(
             fn,
             args,
@@ -348,11 +683,13 @@ class Client:
         )
         if cwd is not None:
             job["cwd"] = cwd
+        if not effective_forward_stdin:
+            job["close_stdin"] = True
         rc, ret = self._stream_session(
             FRAME_EXEC_PY,
             job,
-            forward_stdin=forward_stdin,
-            stdin=stdin,
+            forward_stdin=effective_forward_stdin,
+            stdin=in_stream if stdin_enabled else False,
             stdout=stdout,
             stderr=stderr,
         )
@@ -396,14 +733,111 @@ class Client:
             return client_pull(tls_sock, remote_src, local_dst, recursive=recursive)
 
 
-def run(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> int:
-    """Run fn in a remote process using .simpyremote / env configuration."""
-    return Client().run(fn, *args, **kwargs)
+def run_shell(
+    cmd: str,
+    *,
+    shell: Callable[[str], Any] | None = None,
+    cwd: str | None = None,
+    stdin: Any = None,
+    stdout: Any = None,
+    stderr: Any = None,
+    forward_stdin: bool = True,
+) -> int:
+    """Execute a shell command string on the remote host using .simpyremote / env configuration."""
+    return Client().run_shell(
+        cmd,
+        shell=shell,
+        cwd=cwd,
+        stdin=stdin,
+        stdout=stdout,
+        stderr=stderr,
+        forward_stdin=forward_stdin,
+    )
+
+
+def run_exec(
+    argv: Sequence[str],
+    *,
+    cwd: str | None = None,
+    stdin: Any = None,
+    stdout: Any = None,
+    stderr: Any = None,
+    forward_stdin: bool = True,
+) -> int:
+    """Execute an argv sequence directly without a shell using .simpyremote / env configuration."""
+    return Client().run_exec(
+        argv,
+        cwd=cwd,
+        stdin=stdin,
+        stdout=stdout,
+        stderr=stderr,
+        forward_stdin=forward_stdin,
+    )
+
+
+def capture_shell(
+    cmd: str,
+    *,
+    shell: Callable[[str], Any] | None = None,
+    cwd: str | None = None,
+    stdin: Any = DEVNULL,
+    forward_stdin: bool = True,
+) -> tuple[int, str, str]:
+    """Run a shell command using .simpyremote / env config and return (rc, stdout, stderr)."""
+    return Client().capture_shell(
+        cmd,
+        shell=shell,
+        cwd=cwd,
+        stdin=stdin,
+        forward_stdin=forward_stdin,
+    )
+
+
+def capture_exec(
+    argv: Sequence[str],
+    *,
+    cwd: str | None = None,
+    stdin: Any = DEVNULL,
+    forward_stdin: bool = True,
+) -> tuple[int, str, str]:
+    """Execute an argv sequence using .simpyremote / env config and return (rc, stdout, stderr)."""
+    return Client().capture_exec(
+        argv,
+        cwd=cwd,
+        stdin=stdin,
+        forward_stdin=forward_stdin,
+    )
 
 
 def call[T](fn: Callable[..., T], *args: Any, **kwargs: Any) -> T:
     """Call fn in a stateless remote process and return its serialized result."""
     return Client().call(fn, *args, **kwargs)
+
+
+def call_with[T](
+    fn: Callable[..., T],
+    *,
+    args: tuple[Any, ...] = (),
+    kwargs: dict[str, Any] | None = None,
+    serializer: str = "json",
+    forward_stdin: bool | None = None,
+    cwd: str | None = None,
+    stdin: Any = None,
+    stdout: Any = None,
+    stderr: Any = None,
+) -> T:
+    """Execute fn with explicit RPC options using .simpyremote / env configuration."""
+    return Client().call_with(
+        fn,
+        args=args,
+        kwargs=kwargs,
+        serializer=serializer,
+        forward_stdin=forward_stdin,
+        cwd=cwd,
+        stdin=stdin,
+        stdout=stdout,
+        stderr=stderr,
+    )
 
 
 def push(

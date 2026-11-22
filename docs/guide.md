@@ -9,8 +9,8 @@ For internal protocol framing, concurrency design, and sequence diagrams, see [d
 Key design principles:
 
 - **Zero external runtime dependencies**: Built 100% on Python 3.14+ standard library (`ssl`, `hashlib.scrypt`, `pty`/`ctypes`, `selectors`, `ast`, `tarfile`).
-- **Stateless per-invocation isolation**: Every CLI command, `run()`, and `call()` opens a dedicated TLS 1.3 PSK session, spawns a fresh OS child process on the server, holds the connection until the process exits and output finishes draining, and cleans up immediately.
-- **Realtime interactive PTY when human, clean pipes when scripted**: Interactive terminal invocations automatically allocate a real pseudoterminal (POSIX `pty.openpty` / Windows ConPTY) so shells and REPLs (`python`, `bash`, `powershell.exe`, `vim`) behave natively in realtime. Redirected/piped invocations and Python `run()`/`call()` use 8-bit clean separated `stdout`/`stderr` pipes.
+- **Stateless per-invocation isolation**: Every CLI command, `run_shell()`, `run_exec()`, and `call()` opens a dedicated TLS 1.3 PSK session, spawns a fresh OS child process on the server, holds the connection until the process exits and output finishes draining, and cleans up immediately.
+- **Realtime interactive PTY when human, clean pipes when scripted**: Interactive terminal invocations automatically allocate a real pseudoterminal (POSIX `pty.openpty` / Windows ConPTY) so shells and REPLs (`python`, `bash`, `powershell.exe`, `vim`) behave natively in realtime. Redirected/piped invocations and Python `run_shell()`/`run_exec()`/`call()` use 8-bit clean separated `stdout`/`stderr` pipes.
 - **Deploy anywhere**: Run directly from `src/simpyremote`, distribute a single amalgamated `simpyremote.py` file, or bundle into a standalone PyInstaller `ELF` / `.exe`.
 
 ## Configuration & Precedence
@@ -83,9 +83,9 @@ simpyremote [--remote HOST[:PORT]] [--port PORT] [--auth SECRET] [--ignore-warni
 - **PTY mode (default on interactive terminal)**:
   - `Ctrl+C` (`\x03`), `Ctrl+D` (`\x04`), arrow keys, tab completion, colors, and terminal resize (`SIGWINCH` / Windows console buffer resize) work in realtime.
   - Press `Enter` followed by `~.` to detach the client if a remote process hangs (prints the remote PID so you can inspect or kill it from another session). Type `~~` at the start of a line to send a literal `~`.
-- **Pipe mode (`-T`, redirected I/O, or Python `run()`)**:
-  - `Ctrl+D` (`Ctrl+Z` then `Enter` on Windows console) sends EOF to remote `stdin`.
-  - First `Ctrl+C` sends `SIGINT` (POSIX process group) or `CTRL_BREAK_EVENT` (Windows) to the remote process.
+- **Pipe mode (`-T`, redirected I/O, `run_cmd()`, `run_shell()`, `run_exec()`, or `call()`)**:
+  - `Ctrl+D` (`Ctrl+Z` then `Enter` on Windows console) sends EOF to remote `stdin` (note: `call()` closes remote `stdin` immediately by default unless a `stdin` stream or `forward_stdin=True` is passed).
+  - First `Ctrl+C` sends `SIGINT` (POSIX process group) or `CTRL_BREAK_EVENT` (Windows) to the remote process; in `run_shell()`/`run_exec()`/`call()` this raises `RemoteError` on the client.
   - Pressing `Ctrl+C` twice within 1.5 seconds detaches the client and reports the remote PID.
   - Server-side unconsumed `stdin` buffering is capped at 4 MiB (`MAX_PENDING_STDIN_BYTES`) to prevent unbounded RAM growth when piping large data to a slow-reading process.
 
@@ -94,12 +94,13 @@ simpyremote [--remote HOST[:PORT]] [--port PORT] [--auth SECRET] [--ignore-warni
 ### Quick Helpers (Using `.simpyremote` / Env)
 
 ```python
-from simpyremote import RemoteError, call, pull, push, run
+from simpyremote import DEVNULL, RemoteError, SHELL_BASH, call, capture_exec, capture_shell, pull, push, run_exec, run_shell
 
-def greet(name: str) -> None:
-    print(f"hello {name} from {__name__}")
-
-rc = run(greet, "world")
+rc = run_shell("echo hello && uname -s", stdin=DEVNULL)
+rc = run_shell("echo $((1 + 2))", shell=SHELL_BASH, stdin=DEVNULL)
+rc = run_exec(["python3", "-c", "print('direct exec')"], stdin=DEVNULL)
+rc, out, err = capture_shell("uname -a")
+rc, out, err = capture_exec(["python3", "--version"])
 
 def disk_usage(path: str) -> dict[str, int]:
     import shutil
@@ -121,18 +122,22 @@ Use `Client` to specify connection details in code, reuse the derived PSK/SSL co
 
 ```python
 import io
-from simpyremote import Client, serve
+from simpyremote import Client, DEVNULL, SHELL_POWERSHELL, serve
 
 client = Client(remote="192.168.0.100:2222", auth="example_shared_secret_123456", ignore_warnings=None)
 
-# Run an OS command (stdout/stderr accept BytesIO, binary files, StringIO, or TextIOWrapper)
+# Run a remote shell command (auto-detects remote shell by default, or pass SHELL_SH / SHELL_BASH / SHELL_PWSH / SHELL_POWERSHELL / SHELL_CMD / custom fn)
+out = io.StringIO()
+rc = client.run_shell("Get-Date", shell=SHELL_POWERSHELL, stdout=out, stderr=DEVNULL, stdin=DEVNULL)
+
+# Run an executable directly without a shell
 buf = io.BytesIO()
+rc = client.run_exec(["uname", "-a"], cwd="/tmp", stdout=buf, stdin=DEVNULL)
+
+# Run an interactive PTY or raw OS command directly over FRAME_EXEC_CMD
 rc = client.run_cmd(["uname", "-a"], cwd="/tmp", pty=False, stdout=buf)
 
-# Run a Python function with custom stdio or working directory
-rc = client.run_with(greet, args=("world",), cwd="/tmp", stdout=io.StringIO())
-
-# Stateless RPC with explicit JSON or opt-in pickle serialization
+# Stateless RPC with explicit JSON or opt-in pickle serialization (accepts stdout/stderr/stdin=DEVNULL or False)
 res = client.call_with(disk_usage, args=("/",), cwd="/tmp")
 raw_obj = client.call_with(lambda: (b"bytes", {1, 2}), serializer="pickle")
 

@@ -66,10 +66,14 @@ class _WinCoord(ctypes.Structure):
 def default_shell_argv() -> list[str]:
     """Return the default interactive shell command for the host OS."""
     if sys.platform == "win32":
-        ps = shutil.which("powershell.exe")
+        ps = (
+            shutil.which("pwsh")
+            if _is_wine()
+            else (shutil.which("powershell.exe") or shutil.which("pwsh"))
+        )
         if ps:
             return [ps, "-NoLogo"]
-        return [os.environ.get("COMSPEC") or "cmd.exe"]
+        return [(os.environ.get("COMSPEC") or "cmd.exe").strip('"')]
     return [os.environ.get("SHELL") or "/bin/sh"]
 
 
@@ -1015,7 +1019,7 @@ class StdinForwarder:
                 return
             try:
                 fd = self._stdin.fileno()
-            except (AttributeError, OSError, io.UnsupportedOperation):
+            except (AttributeError, OSError, io.UnsupportedOperation, ValueError):
                 self._run_stream_fallback()
                 return
 

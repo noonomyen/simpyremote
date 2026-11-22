@@ -93,7 +93,7 @@ def amalgamate(src_pkg_dir: Path, out_file: Path) -> None:
             "\n".join(import_lines),
             "",
             "_AMALGAMATED = True",
-            '__all__ = ["Client", "RemoteError", "call", "main", "pull", "push", "run", "serve"]',
+            '__all__ = ["DEVNULL", "SHELL_AUTO", "SHELL_BASH", "SHELL_CMD", "SHELL_POWERSHELL", "SHELL_PWSH", "SHELL_SH", "Client", "RemoteError", "call", "call_with", "capture_exec", "capture_shell", "main", "pull", "push", "run_exec", "run_shell", "serve"]',
             "",
         ]
     )

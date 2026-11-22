@@ -1,6 +1,6 @@
 ---
 name: simpyremote
-description: Execute remote commands, interactive PTY shells/REPLs, Python functions (run/call), and streaming file transfers (push/pull) across Linux and Windows targets over mutual-auth TLS 1.3 PSK using simpyremote. Use when interacting with a remote host via CLI or Python scripts where .simpyremote, SIMPYREMOTE_SECRET, or --remote/--auth credentials are available.
+description: Execute remote commands, interactive PTY shells/REPLs, Python functions (call), shell/exec runners (run_shell/run_exec), and streaming file transfers (push/pull) across Linux and Windows targets over mutual-auth TLS 1.3 PSK using simpyremote. Use when interacting with a remote host via CLI or Python scripts where .simpyremote, SIMPYREMOTE_SECRET, or --remote/--auth credentials are available.
 ---
 
 # simpyremote Agent Skill
@@ -12,16 +12,16 @@ description: Execute remote commands, interactive PTY shells/REPLs, Python funct
 Keep four architectural principles in mind when using it:
 
 1. **No heavy orchestration layer**: `simpyremote` intentionally avoids high-level state machines or agent-specific wrappers. Compose standard OS commands and plain Python functions directly.
-2. **One invocation = one isolated OS process**: Every CLI command, `run(fn)`, and `call(fn)` opens a fresh TLS 1.3 PSK session, spawns a fresh child process on the remote host, holds the session until the process exits and output drains, and returns the exit code or return value. No remote interpreter state persists between invocations.
-3. **Auto-PTY vs clean pipes**: CLI commands automatically allocate a realtime pseudoterminal (POSIX `pty.openpty` / Windows ConPTY) when attached to an interactive terminal, and use 8-bit clean separated `stdout`/`stderr` pipes when stdin/stdout is redirected (or forced with `-T`/`--no-pty`). Python `run()` and `call()` always use separated pipes with line-buffered remote stdio.
+2. **One invocation = one isolated OS process**: Every CLI command, `run_shell()`, `run_exec()`, and `call(fn)` opens a fresh TLS 1.3 PSK session, spawns a fresh child process on the remote host, holds the session until the process exits and output drains, and returns the exit code or return value. No remote interpreter state persists between invocations.
+3. **Auto-PTY vs clean pipes**: CLI commands automatically allocate a realtime pseudoterminal (POSIX `pty.openpty` / Windows ConPTY) when attached to an interactive terminal, and use 8-bit clean separated `stdout`/`stderr` pipes when stdin/stdout is redirected (or forced with `-T`/`--no-pty`). Python `call()` uses separated pipes with line-buffered Python stdio; `run_shell()` and `run_exec()` run child OS processes over separated OS pipes with standard OS pipe buffering.
 4. **Single shared secret = mutual TLS 1.3 auth**: Both sides derive a 32-byte key from the secret via `scrypt` and authenticate using TLS 1.3 External PSK (X.509 certificate handshakes are rejected). Anyone holding the secret has full command execution as the server user.
 
 ## Invocation & Distribution Modes
 
 `simpyremote` can be invoked in three equivalent forms:
 
-- **Installed package**: CLI `simpyremote ...` and Python `from simpyremote import ...`.
-- **Standalone compiled binary** (`./simpyremote` or `simpyremote.exe`): Full CLI client and server (including serving remote Python `run()`/`call()` workers), with no Python install needed on the target. Cannot be `import`ed as a Python module.
+- **Installed package / source checkout**: CLI `simpyremote ...` (or `PYTHONPATH=src python -m simpyremote ...`) and Python `from simpyremote import ...`.
+- **Standalone compiled binary** (`./simpyremote` or `simpyremote.exe`): Full CLI client and server (including serving remote Python `call()` / `run_shell()` / `run_exec()` workers), with no Python install needed on the target. Cannot be `import`ed as a Python module.
 - **Single-file Python script** (`simpyremote.py`, requires Python 3.14+): Run CLI via `python /path/to/simpyremote.py ...`, or import its Python API by adding its parent directory to `PYTHONPATH` / `sys.path` (`PYTHONPATH=/path/to/dir python -c "from simpyremote import Client"`).
 
 ## Primitives & API Reference
@@ -68,25 +68,54 @@ Important CLI rules:
 Top-level helpers read `.simpyremote` / `SIMPYREMOTE_SECRET`:
 
 ```python
-from simpyremote import Client, RemoteError, call, pull, push, run, serve
+from simpyremote import (
+    DEVNULL,
+    SHELL_AUTO,
+    SHELL_BASH,
+    SHELL_CMD,
+    SHELL_POWERSHELL,
+    SHELL_PWSH,
+    SHELL_SH,
+    Client,
+    RemoteError,
+    call,
+    call_with,
+    capture_exec,
+    capture_shell,
+    pull,
+    push,
+    run_exec,
+    run_shell,
+    serve,
+)
 ```
 
-- `run(fn, *args, **kwargs) -> int`: Serializes `fn`, executes it in an isolated remote OS process with `__name__ == "__main__"` and live `stdin`/`stdout`/`stderr`, and returns the process exit code.
-- `call(fn, *args, **kwargs) -> T`: Executes `fn` in a fresh stateless remote process and returns its JSON-serialized return value. `stdout`/`stderr` still stream live without corrupting the return payload. Remote exceptions raise `RemoteError` (`exc.exc_type`, `exc.remote_traceback`).
-- `push(local_src, remote_dst, *, recursive=False) -> tuple[str, int]`: Streams a file (64 KiB chunks, SHA-256 verified, atomic `os.replace`) or directory (`tarfile` archive verified before extraction with `filter="data"` and strict target-directory scoping). Returns `(saved_remote_path, bytes_transferred)`.
-- `pull(remote_src, local_dst, *, recursive=False) -> tuple[Path, int]`: Downloads a file or directory with the same integrity and path-safety checks. Returns `(saved_local_path, bytes_transferred)`.
+- `run_shell(cmd, *, shell=None, cwd=None, stdin=None, stdout=None, stderr=None, forward_stdin=True) -> int`: Runs a shell command string on the remote host via the `call` protocol (`shell` must be `None` for `SHELL_AUTO`, one of `SHELL_SH`/`SHELL_BASH`/`SHELL_PWSH`/`SHELL_POWERSHELL`/`SHELL_CMD`, or a custom `def my_shell(cmd: str) -> int`, never a path string). Custom `shell` callables execute remotely under the `call` serialization rules (`cwd=` is applied beforehand, and `from ... import ...` / helper defs must live inside the function); missing shell binaries or interrupts raise `RemoteError` (`FileNotFoundError` / `KeyboardInterrupt`), while normal non-zero exit codes return `int`.
+- `run_exec(argv, *, cwd=None, stdin=None, stdout=None, stderr=None, forward_stdin=True) -> int`: Executes an `argv` sequence directly without a shell via the `call` protocol over separated pipes; missing binaries raise `RemoteError` (`FileNotFoundError`).
+- `capture_shell(cmd, *, shell=None, cwd=None, stdin=DEVNULL, forward_stdin=True) -> tuple[int, str, str]`: Convenience wrapper over `run_shell` returning `(returncode, stdout_text, stderr_text)` (defaults `stdin=DEVNULL` so commands do not wait on local `stdin`).
+- `capture_exec(argv, *, cwd=None, stdin=DEVNULL, forward_stdin=True) -> tuple[int, str, str]`: Convenience wrapper over `run_exec` returning `(returncode, stdout_text, stderr_text)`.
+- `call(fn, *args, **kwargs) -> T` / `call_with(fn, *, args=(), kwargs=None, ...) -> T`: Executes `fn` in a fresh stateless remote process and returns its JSON-serialized return value (`call_with` also supports `serializer="pickle"`, `cwd=`, and custom stdio). `stdout`/`stderr` still stream live without corrupting the return payload. Remote exceptions raise `RemoteError` (`exc.exc_type`, `exc.remote_traceback`).
+- `push(local_src, remote_dst, *, recursive=False) -> tuple[str, int]`: Streams a file (64 KiB chunks, SHA-256 verified, atomic `os.replace`) or directory (`tarfile` archive verified before extraction with `filter="data"` and strict target-directory scoping). Returns `(saved_remote_path, bytes_transferred)`. Missing local paths raise `FileNotFoundError`.
+- `pull(remote_src, local_dst, *, recursive=False) -> tuple[Path, int]`: Downloads a file or directory with the same integrity and path-safety checks. Returns `(saved_local_path, bytes_transferred)`. Missing remote paths raise `FileNotFoundError` and unflagged remote directories raise `IsADirectoryError` (matching `push`).
 - `serve(host="127.0.0.1", port=2222, pre_auth=None, *, stop_event=None, on_listening=None, ignore_warnings=False) -> None`: Starts an embedded server in Python (`port=0` picks an ephemeral port; `on_listening(host, bound_port, secret, was_generated)` fires once listening; set `stop_event` to stop cleanly).
 
-Use `Client` when specifying target overrides or advanced options without colliding with `fn`'s `**kwargs`:
+Use `Client` when specifying target overrides or reusing a derived PSK/SSL context (`run_cmd` uses `FRAME_EXEC_CMD` directly with optional `pty` and `argv=None` default shell; `run_exec` always uses separated pipes via the `call` protocol, and `close_stdin` / `stdin=DEVNULL` only closes stdin in pipe mode):
 
 ```python
+import io
+from simpyremote import Client, DEVNULL, SHELL_SH
+
 client = Client(remote="192.168.0.100:2222", auth="example_shared_secret_123456", ignore_warnings=None)
 # or Client(remote="192.168.0.100", port=2222, auth="example_shared_secret_123456")
 
+# Common capture pattern
+rc, out_text, err_text = client.capture_shell("uname -a && id", shell=SHELL_SH, cwd="/tmp")
+out, err = io.StringIO(), io.StringIO()
+rc = client.run_shell("uname -a && id", shell=SHELL_SH, cwd="/tmp", stdin=DEVNULL, stdout=out, stderr=err)
+
 rc = client.run_cmd(["uname", "-a"], cwd="/tmp", pty=False, stdin=..., stdout=..., stderr=...)
 rc = client.run_cmd()  # argv=None opens the server's default shell
-rc = client.run(fn, *args, **kwargs)
-rc = client.run_with(fn, args=(1,), kwargs={"k": "v"}, cwd="/tmp", serializer="json", stdin=..., stdout=..., stderr=...)
+rc = client.run_exec(["uname", "-a"], cwd="/tmp", stdin=DEVNULL, stdout=out, stderr=err)
 val = client.call(fn, *args, **kwargs)
 val = client.call_with(fn, args=(1,), kwargs={"k": "v"}, cwd="/tmp", serializer="json", forward_stdin=False, stdin=..., stdout=..., stderr=...)
 val_bin = client.call_with(fn_returning_bytes, serializer="pickle")
@@ -94,7 +123,10 @@ remote_path, nbytes = client.push("./local.bin", "/tmp/remote.bin", recursive=Fa
 local_path, nbytes = client.pull("/tmp/remote.bin", "./out.bin", recursive=False)
 ```
 
-Stream parameters (`stdin`, `stdout`, `stderr`): `stdout` and `stderr` accept binary streams (`io.BytesIO`, `open(..., "wb")`), text wrappers with a `.buffer` (`io.TextIOWrapper`, `open(..., "w")`), and plain text streams (`io.StringIO`, using incremental UTF-8 decoding). Note that server-side unconsumed `stdin` is capped at 4 MiB (`MAX_PENDING_STDIN_BYTES`); piping >4 MiB into a remote process that does not drain stdin aborts the session with a `RemoteError`.
+Stream parameters (`stdin`, `stdout`, `stderr`):
+- `stdout` and `stderr` accept `None` (inherit local `sys.stdout`/`sys.stderr`), binary streams (`io.BytesIO`, `open(..., "wb")`), text wrappers with `.buffer` (`io.TextIOWrapper`, `open(..., "w")`), plain text streams (`io.StringIO`, using incremental UTF-8 decoding), or `DEVNULL` / `False` to discard output.
+- `stdin` accepts `None` (inherit `sys.stdin` in `run_*`, or EOF in `call_with`), `bytes`/`bytearray`/`memoryview`/`str` (UTF-8 encoded), readable streams (`io.BytesIO`, `io.StringIO`, open files), or `DEVNULL` / `False` (or `forward_stdin=False`) to close remote pipe `stdin` immediately with EOF. In `call_with`, passing a `stdin` stream or `bytes`/`str` enables `forward_stdin` automatically unless `forward_stdin=False` is set. Note: remote `cwd`, `remote_src`, and `remote_dst` must be `str` (never `pathlib.Path`).
+- Server-side unconsumed `stdin` is capped at 4 MiB (`MAX_PENDING_STDIN_BYTES`); piping >4 MiB into a remote process that does not drain stdin aborts the session with a `RemoteError`.
 
 ### 3. File & Directory Transfer Semantics
 
@@ -121,10 +153,9 @@ On POSIX, `./.simpyremote` is ignored if owned by another user or writable by gr
 
 | Goal | Primitive | Why |
 | :--- | :--- | :--- |
-| Run an existing OS binary, shell pipeline, or tool | `simpyremote -- <cmd>` or `Client.run_cmd` | Direct process execution, no Python serialization overhead. |
+| Run an existing OS binary, shell pipeline, or tool | `simpyremote -- <cmd>`, `run_shell`, `run_exec`, or `Client.run_cmd` | Direct exec or configurable remote shell execution over clean pipes. |
 | Interactive shell, REPL, debugger, or TUI | `simpyremote` / `simpyremote -- <repl>` | Auto-PTY delivers raw keystrokes, colors, and resize events in realtime. |
-| Query remote state and get structured Python data back | `call(fn, ...)` | Returns typed JSON data (dicts/lists/strings/ints) cleanly separated from stdout/stderr. |
-| Run a long-lived Python script with live output/stdin | `run(fn, ...)` | Streams live line-buffered stdio, supports stdin, returns exit code. |
+| Query remote state or run Python code | `call(fn, ...)` | Returns typed JSON data (dicts/lists/strings/ints) cleanly separated from stdout/stderr, with live stdio. |
 | Move files or directory trees | `push` / `pull` or `--push` / `--pull` | Chunked 64 KiB streaming with SHA-256 verification and traversal guards. |
 
 ## Recommended Usage Patterns for Agents
@@ -164,7 +195,7 @@ When running CLI commands from an agent harness or capturing binary output, pass
 ### Pattern 4: Recovering from Hung Remote Processes
 
 - In **PTY mode**: `Ctrl+C` forwards `\x03` to the remote PTY foreground group; if the remote process ignores it, press `Enter` then `~.` to detach cleanly.
-- In **pipe mode** (`-T` or `run()`): first `Ctrl+C` sends `SIGINT` (POSIX process group) or `CTRL_BREAK_EVENT` (Windows); pressing `Ctrl+C` twice within 1.5s detaches and prints `(remote pid=...)`.
+- In **pipe mode** (`-T`, `run_shell()`, `run_exec()`, or `call()`): first `Ctrl+C` sends `SIGINT` (POSIX process group) or `CTRL_BREAK_EVENT` (Windows); pressing `Ctrl+C` twice within 1.5s detaches and prints `(remote pid=...)`.
 - After detaching, launch a second `simpyremote` invocation to inspect or terminate that PID (e.g. `simpyremote -- kill -9 <pid>` on POSIX or `simpyremote -- taskkill /PID <pid> /F` on Windows).
 
 ### Pattern 5: Cross-OS Workflows (Linux <-> Windows)
@@ -179,7 +210,7 @@ When running CLI commands from an agent harness or capturing binary output, pass
 3. **Closures & globals**: JSON-primitive globals/nonlocals are captured in both modes; non-JSON values (e.g. `Path`, `set`, custom objects) are silently omitted under default `serializer="json"` (causing remote `NameError`) unless passed as arguments or using `serializer="pickle"`.
 4. **Decorators**: Pass-through decorators and `@functools.wraps` functions work, but wrapper logic is bypassed when decorators are stripped/unwrapped. Plain non-`wraps` wrapper decorators fail remotely.
 5. **Synchronous functions only**: `async def` coroutines, generators, and async generators are rejected with `TypeError`; wrap `asyncio.run(...)` inside a regular `def` function instead.
-6. **JSON by default, pickle opt-in**: `call()` uses JSON by default and rejects any server response whose serializer does not match what the client requested. Only pass `serializer="pickle"` to `Client.call_with()` when both sides are trusted and you need non-JSON Python types (e.g. `bytes`, `set`, `tuple`).
+6. **JSON by default, pickle opt-in**: `call()` uses JSON by default and rejects any server response whose serializer does not match what the client requested. Only pass `serializer="pickle"` to `call_with()` / `Client.call_with()` when both sides are trusted and you need non-JSON Python types (e.g. `bytes`, `set`, `tuple`).
 7. **Worker safe-path mode (`python -P`)**: Remote workers run with `-P`, so the remote working directory is not auto-added to `sys.path`. If a remote function needs to import local modules from the remote CWD, add `sys.path.insert(0, ".")` inside the function.
 8. **Statelessness**: `os.chdir()`, environment edits, and global variables inside `call()` disappear as soon as the call returns. Always pass explicit paths or `cwd=...`.
 

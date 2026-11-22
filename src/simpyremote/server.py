@@ -72,8 +72,8 @@ def _send_error_bounded(tls_sock: ssl.SSLSocket, message: str) -> None:
 def _clean_child_env(base_env: dict[str, str] | None, *, is_worker: bool) -> dict[str, str]:
     env = (os.environ if base_env is None else base_env).copy()
     env.pop("SIMPYREMOTE_SECRET", None)
-    if not is_worker and getattr(sys, "frozen", False):
-        orig_ld = env.get("LD_LIBRARY_PATH_ORIG")
+    if not is_worker and getattr(sys, "frozen", False) and sys.platform != "win32":
+        orig_ld = env.pop("LD_LIBRARY_PATH_ORIG", None)
         if orig_ld is not None:
             env["LD_LIBRARY_PATH"] = orig_ld
         else:
@@ -239,6 +239,7 @@ def _run_process_session(
     cols: int = 80,
     rows: int = 24,
     term: str | None = None,
+    close_stdin: bool = False,
 ) -> None:
     is_worker = job_payload is not None
     proc_env = _clean_child_env(env, is_worker=is_worker)
@@ -287,6 +288,9 @@ def _run_process_session(
         if not stdin_closed.is_set():
             stdin_closed.set()
             stdin_q.put_nowait(None)
+
+    if close_stdin:
+        _close_stdin_queue()
 
     t_in = threading.Thread(
         target=_stdin_writer_loop,
@@ -419,6 +423,7 @@ def _handle_client(
                 cols=cols,
                 rows=rows,
                 term=term,
+                close_stdin=bool(req.get("close_stdin", False)),
             )
         elif msg_type == FRAME_EXEC_PY:
             job = json.loads(payload.decode("utf-8"))
@@ -430,6 +435,7 @@ def _handle_client(
                 cwd=job.get("cwd"),
                 job_payload=payload,
                 mode=str(job.get("mode", "run")),
+                close_stdin=bool(job.get("close_stdin", False)),
             )
         elif msg_type == FRAME_FILE_PUT:
             tls_sock.settimeout(TRANSFER_IDLE_TIMEOUT)

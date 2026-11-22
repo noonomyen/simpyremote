@@ -5,7 +5,7 @@ A lightweight remote shell, Python function runner, and file transfer tool using
 ## What It Does
 
 - Run commands or open a realtime interactive shell/REPL on a remote machine (automatically allocates a PTY when used from a terminal, and uses clean raw pipes when redirected).
-- Send a Python function from your script to run on the remote machine (`run` for live terminal I/O, `call` to get the return value back).
+- Run remote shell commands (`run_shell`), direct executables (`run_exec`), or Python functions (`call`) from your Python scripts.
 - Upload and download files or folders (`push` / `pull`).
 - Runs from source (`src/simpyremote`), as a single `.py` file (`dist/simpyremote.py`), or as a standalone PyInstaller executable (`ELF` / `.exe`) with zero external runtime dependencies.
 
@@ -69,20 +69,24 @@ simpyremote --pull /var/log/app.log ./app.log
 simpyremote -r --push ./my_folder /tmp/dest
 ```
 
-In interactive PTY mode, `Ctrl+C`, `Ctrl+D`, tab completion, arrow keys, and terminal resize work in realtime; press `Enter` then `~.` to detach if a remote process hangs. In pipe mode (`-T` or `run()`), use `Ctrl+D` (`Ctrl+Z` then `Enter` on Windows) for EOF and `Ctrl+C` to interrupt (press twice quickly to detach).
+In interactive PTY mode, `Ctrl+C`, `Ctrl+D`, tab completion, arrow keys, and terminal resize work in realtime; press `Enter` then `~.` to detach if a remote process hangs. In CLI/pipe mode (`-T` or `run_cmd`), use `Ctrl+D` (`Ctrl+Z` then `Enter` on Windows) for EOF and `Ctrl+C` to interrupt (press twice quickly to detach). In `run_shell()`, `run_exec()`, and `call()`, `Ctrl+C` / detach raises `RemoteError` (and `call()` closes remote `stdin` immediately unless a `stdin` stream or `forward_stdin=True` is passed).
 
-### 4. Use from Python (`run`, `call`, `push`, `pull`)
+### 4. Use from Python (`run_shell`, `run_exec`, `capture_shell`, `capture_exec`, `call`, `push`, `pull`)
 
 ```python
-from simpyremote import call, pull, push, run
+from simpyremote import DEVNULL, SHELL_BASH, call, capture_shell, pull, push, run_exec, run_shell
 
-def hello():
-    print(__name__)
+# Run a shell command (auto-detects remote OS shell, or pass SHELL_SH / SHELL_BASH / SHELL_PWSH / SHELL_POWERSHELL / SHELL_CMD / custom fn)
+rc = run_shell("uname -a && uptime")
+rc = run_shell("echo $((1 + 2))", shell=SHELL_BASH, stdin=DEVNULL)
 
-# Runs on the remote machine with live stdio and returns exit code
-run(hello)
+# Or capture (returncode, stdout_text, stderr_text) directly
+rc, out, err = capture_shell("uname -a")
 
-# Runs in a fresh remote process and returns the function's return value
+# Run an executable directly without a shell
+rc = run_exec(["python3", "--version"])
+
+# Run a Python function in a fresh remote process and get its return value
 def list_logs(path):
     import os
     return [f for f in os.listdir(path) if f.endswith(".log")]

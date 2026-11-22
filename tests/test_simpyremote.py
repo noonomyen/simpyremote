@@ -22,7 +22,26 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from simpyremote import Client, RemoteError, call, pull, push, run, serve
+from simpyremote import (
+    DEVNULL,
+    SHELL_AUTO,
+    SHELL_BASH,
+    SHELL_CMD,
+    SHELL_POWERSHELL,
+    SHELL_PWSH,
+    SHELL_SH,
+    Client,
+    RemoteError,
+    call,
+    call_with,
+    capture_exec,
+    capture_shell,
+    pull,
+    push,
+    run_exec,
+    run_shell,
+    serve,
+)
 from simpyremote.cli import main as cli_main
 from simpyremote.client import _flush_text_decoder, _write_stream
 from simpyremote.config import (
@@ -53,6 +72,7 @@ from simpyremote.serialize import (
     _is_json_primitive,
     serialize_callable,
 )
+from simpyremote.server import _clean_child_env
 from simpyremote.tls import (
     build_client_ssl_context,
     build_server_ssl_context,
@@ -62,6 +82,7 @@ from simpyremote.tls import (
 )
 from simpyremote.transfer import (
     _prepare_tar_members,
+    _raise_transfer_error,
     _resolve_dest_file,
     _sanitize_leaf_name,
 )
@@ -530,15 +551,470 @@ class SimpyRemoteTests(unittest.TestCase):
             else:
                 os.environ["SIMPYREMOTE_SECRET"] = old
 
-    def test_run_python_function_and_module_globals(self) -> None:
-        def x() -> None:
+    def test_call_python_function_and_module_globals(self) -> None:
+        def x() -> str:
             print(__name__)
+            return __name__
 
         buf = io.StringIO()
         with redirect_stdout(buf):
-            rc = self.client.run(x)
-        self.assertEqual(rc, 0)
+            res = self.client.call(x)
+        self.assertEqual(res, "__main__")
         self.assertEqual(buf.getvalue().strip(), "__main__")
+
+    def test_run_shell_auto_preset_and_custom(self) -> None:
+        out = io.StringIO()
+        rc = self.client.run_shell("echo shell-auto-ok", stdout=out, stdin=DEVNULL)
+        self.assertEqual(rc, 0)
+        self.assertIn("shell-auto-ok", out.getvalue())
+
+        if os.name == "posix":
+            sh_out = io.StringIO()
+            rc_sh = self.client.run_shell(
+                "VAL=42; echo v=$VAL >&1; echo err >&2; exit 3",
+                shell=SHELL_SH,
+                stdout=sh_out,
+                stderr=DEVNULL,
+                stdin=DEVNULL,
+            )
+            self.assertEqual(rc_sh, 3)
+            self.assertEqual(sh_out.getvalue().strip(), "v=42")
+
+            rc_ml, ml_out, _ = self.client.capture_shell(
+                "A='hello'\nprintf '%s\\n' \"$A 'world'\"",
+                shell=SHELL_SH,
+            )
+            self.assertEqual(rc_ml, 0)
+            self.assertEqual(ml_out.strip(), "hello 'world'")
+
+            if shutil.which("bash"):
+                bash_out = io.StringIO()
+                self.assertEqual(
+                    self.client.run_shell(
+                        "[[ ok == ok ]] && echo $((20 + 22))",
+                        shell=SHELL_BASH,
+                        stdout=bash_out,
+                        stdin=DEVNULL,
+                    ),
+                    0,
+                )
+                self.assertEqual(bash_out.getvalue().strip(), "42")
+
+            # SHELL_AUTO honors POSIX $SHELL and falls back to sh for non-POSIX $SHELL
+            old_shell = os.environ.get("SHELL")
+            try:
+                bash_path = shutil.which("bash")
+                if bash_path:
+                    os.environ["SHELL"] = bash_path
+                    rc_b, out_b, _ = self.client.capture_shell(
+                        "[[ -n ok ]] && echo auto-bash"
+                    )
+                    self.assertEqual(rc_b, 0)
+                    self.assertEqual(out_b.strip(), "auto-bash")
+
+                os.environ["SHELL"] = "/nonexistent/pwsh"
+                rc_fb, out_fb, _ = self.client.capture_shell("echo auto-fallback")
+                self.assertEqual(rc_fb, 0)
+                self.assertEqual(out_fb.strip(), "auto-fallback")
+            finally:
+                if old_shell is None:
+                    os.environ.pop("SHELL", None)
+                else:
+                    os.environ["SHELL"] = old_shell
+
+            if not shutil.which("cmd.exe"):
+                with self.assertRaises(RemoteError) as cmd_missing:
+                    self.client.run_shell("echo hi", shell=SHELL_CMD, stdin=DEVNULL)
+                self.assertEqual(cmd_missing.exception.exc_type, "FileNotFoundError")
+
+        if sys.platform == "win32":
+            rc_cmd, out_cmd, _ = self.client.capture_shell(
+                'echo "a & b" & exit /b 5',
+                shell=SHELL_CMD,
+            )
+            self.assertEqual(rc_cmd, 5)
+            self.assertIn('"a & b"', out_cmd)
+
+            rc_auto_q, out_auto_q, _ = self.client.capture_shell('echo "auto & ok"')
+            self.assertEqual(rc_auto_q, 0)
+            self.assertIn("auto & ok", out_auto_q)
+
+            if not _is_wine() and shutil.which("powershell.exe"):
+                rc_ps, out_ps, _ = self.client.capture_shell(
+                    '$x = 21 * 2; Write-Output "ps=$x"',
+                    shell=SHELL_POWERSHELL,
+                )
+                self.assertEqual(rc_ps, 0)
+                self.assertIn("ps=42", out_ps)
+
+            if not shutil.which("sh"):
+                with self.assertRaises(RemoteError) as sh_missing:
+                    self.client.run_shell("echo hi", shell=SHELL_SH, stdin=DEVNULL)
+                self.assertEqual(sh_missing.exception.exc_type, "FileNotFoundError")
+
+        # Verify SHELL_PWSH end-to-end UTF-16LE -EncodedCommand via a temporary shim in PATH
+        with tempfile.TemporaryDirectory() as shim_dir:
+            shim_py = Path(shim_dir) / "pwsh_shim.py"
+            shim_py.write_text(
+                (
+                    "import base64, json, sys\n"
+                    "args = sys.argv[1:]\n"
+                    "idx = args.index('-EncodedCommand')\n"
+                    "decoded = base64.b64decode(args[idx + 1]).decode('utf-16le')\n"
+                    "print(json.dumps({'flags': args[:idx + 1], 'cmd': decoded}, ensure_ascii=False))\n"
+                ),
+                encoding="utf-8",
+            )
+            if sys.platform == "win32":
+                shim_bin = Path(shim_dir) / "pwsh.cmd"
+                shim_bin.write_text(
+                    f'@echo off\r\n"{sys.executable}" "{shim_py}" %*\r\n',
+                    encoding="utf-8",
+                )
+            else:
+                shim_bin = Path(shim_dir) / "pwsh"
+                shim_bin.write_text(
+                    f"#!{sys.executable}\n{shim_py.read_text(encoding='utf-8')}",
+                    encoding="utf-8",
+                )
+                os.chmod(shim_bin, 0o755)
+
+            old_path = os.environ.get("PATH", "")
+            os.environ["PATH"] = f"{shim_dir}{os.pathsep}{old_path}"
+            try:
+                rc_pw, out_pw, _ = self.client.capture_shell(
+                    'Write-Output "hello \'quotes\'"\nexit 0',
+                    shell=SHELL_PWSH,
+                )
+                self.assertEqual(rc_pw, 0)
+                parsed_pw = json.loads(out_pw.strip())
+                self.assertEqual(parsed_pw["flags"], ["-NoLogo", "-NoProfile", "-EncodedCommand"])
+                self.assertEqual(parsed_pw["cmd"], 'Write-Output "hello \'quotes\'"\nexit 0')
+
+                rc_pw_empty, out_pw_empty, _ = self.client.capture_shell("", shell=SHELL_PWSH)
+                self.assertEqual(rc_pw_empty, 0)
+                self.assertEqual(json.loads(out_pw_empty.strip())["cmd"], " ")
+            finally:
+                os.environ["PATH"] = old_path
+
+        def custom_py_shell(cmd: str) -> int:
+            import subprocess
+            import sys
+
+            return subprocess.run([sys.executable, "-c", cmd]).returncode
+
+        custom_out = io.StringIO()
+        rc_custom = self.client.run_shell(
+            "import sys; print('via:' + sys.stdin.read())",
+            shell=custom_py_shell,
+            stdin=io.BytesIO(b"pipe-ok"),
+            stdout=custom_out,
+        )
+        self.assertEqual(rc_custom, 0)
+        self.assertEqual(custom_out.getvalue().strip(), "via:pipe-ok")
+
+        def oneshot_stdin_shell(cmd: str) -> int:
+            import subprocess
+            import sys
+
+            return subprocess.run(
+                [sys.executable, "-"],
+                input=cmd.encode("utf-8"),
+            ).returncode
+
+        oneshot_out = io.StringIO()
+        rc_oneshot = self.client.run_shell(
+            "print('oneshot-stdin-ok')",
+            shell=oneshot_stdin_shell,
+            stdout=oneshot_out,
+            stdin=DEVNULL,
+        )
+        self.assertEqual(rc_oneshot, 0)
+        self.assertEqual(oneshot_out.getvalue().strip(), "oneshot-stdin-ok")
+
+    def test_run_exec_stdio_devnull_and_errors(self) -> None:
+        bin_out = io.BytesIO()
+        bin_err = io.BytesIO()
+        rc = self.client.run_exec(
+            [
+                sys.executable,
+                "-c",
+                "import sys; data = sys.stdin.read(); sys.stdout.buffer.write(b'out:' + data.encode()); sys.stderr.buffer.write(b'err')",
+            ],
+            stdin=io.BytesIO(b"hello"),
+            stdout=bin_out,
+            stderr=bin_err,
+        )
+        self.assertEqual(rc, 0)
+        self.assertEqual(bin_out.getvalue(), b"out:hello")
+        self.assertEqual(bin_err.getvalue(), b"err")
+
+        # stdin=DEVNULL and forward_stdin=False must close remote stdin immediately
+        eof_out = io.StringIO()
+        rc_eof = self.client.run_exec(
+            [sys.executable, "-c", "import sys; print(repr(sys.stdin.read()))"],
+            stdin=DEVNULL,
+            stdout=eof_out,
+        )
+        self.assertEqual(rc_eof, 0)
+        self.assertEqual(eof_out.getvalue().strip(), "''")
+
+        # stdout=False / stderr=DEVNULL discard output cleanly
+        self.assertEqual(
+            self.client.run_exec(
+                [sys.executable, "-c", "import sys; print('drop'); print('err', file=sys.stderr)"],
+                stdin=False,
+                stdout=False,
+                stderr=DEVNULL,
+            ),
+            0,
+        )
+
+        with self.assertRaises(RemoteError) as ctx:
+            self.client.run_exec(["definitely_missing_binary_simpyremote_test"], stdin=DEVNULL)
+        self.assertEqual(ctx.exception.exc_type, "FileNotFoundError")
+
+        with self.assertRaises(TypeError):
+            self.client.run_shell(["echo", "bad"])  # type: ignore[arg-type]
+        with self.assertRaises(TypeError):
+            self.client.run_shell("echo ok", shell="sh")  # type: ignore[arg-type]
+        with self.assertRaises(TypeError):
+            self.client.run_exec("echo bad")  # type: ignore[arg-type]
+        with self.assertRaises(TypeError):
+            self.client.run_exec(b"ls")  # type: ignore[arg-type]
+        with self.assertRaises(TypeError):
+            self.client.run_exec(bytearray(b"ls"))  # type: ignore[arg-type]
+        with self.assertRaises(ValueError):
+            self.client.run_exec([])
+
+        with self.assertRaises(TypeError):
+            self.client.run_shell("echo hi", stdin=123)
+        with self.assertRaises(TypeError):
+            self.client.run_shell("echo hi", stdout=123)
+        with self.assertRaises(TypeError):
+            self.client.run_shell("echo hi", stdout=b"")
+        with self.assertRaises(TypeError):
+            self.client.run_shell("echo hi", stderr=123)
+
+        # bytes / str stdin and forward_stdin=False
+        bytes_out = io.StringIO()
+        self.assertEqual(
+            self.client.run_exec(
+                [sys.executable, "-c", "import sys; print(sys.stdin.read().upper())"],
+                stdin=b"raw-bytes",
+                stdout=bytes_out,
+            ),
+            0,
+        )
+        self.assertEqual(bytes_out.getvalue().strip(), "RAW-BYTES")
+
+        str_out = io.StringIO()
+        self.assertEqual(
+            self.client.run_exec(
+                [sys.executable, "-c", "import sys; print(sys.stdin.read())"],
+                stdin="raw-str",
+                stdout=str_out,
+            ),
+            0,
+        )
+        self.assertEqual(str_out.getvalue().strip(), "raw-str")
+
+        fwd_false_out = io.StringIO()
+        self.assertEqual(
+            self.client.run_exec(
+                [sys.executable, "-c", "import sys; print(repr(sys.stdin.read()))"],
+                stdin=io.BytesIO(b"ignored"),
+                forward_stdin=False,
+                stdout=fwd_false_out,
+            ),
+            0,
+        )
+        self.assertEqual(fwd_false_out.getvalue().strip(), "''")
+
+        # cwd= on run_shell, run_exec, call_with
+        with tempfile.TemporaryDirectory() as work_dir:
+            sh_cwd_out = io.StringIO()
+            self.assertEqual(
+                self.client.run_shell(
+                    f"{sys.executable} -c \"import os; print(os.getcwd())\"",
+                    cwd=work_dir,
+                    stdin=DEVNULL,
+                    stdout=sh_cwd_out,
+                ),
+                0,
+            )
+            self.assertEqual(Path(sh_cwd_out.getvalue().strip()).resolve(), Path(work_dir).resolve())
+
+            ex_cwd_out = io.StringIO()
+            self.assertEqual(
+                self.client.run_exec(
+                    [sys.executable, "-c", "import os; print(os.getcwd())"],
+                    cwd=work_dir,
+                    stdin=DEVNULL,
+                    stdout=ex_cwd_out,
+                ),
+                0,
+            )
+            self.assertEqual(Path(ex_cwd_out.getvalue().strip()).resolve(), Path(work_dir).resolve())
+
+            call_cwd = self.client.call_with(os.getcwd, cwd=work_dir)
+            self.assertEqual(Path(call_cwd).resolve(), Path(work_dir).resolve())
+
+        # Custom shell returning None defaults to exit code 0; empty cmd works cleanly
+        def void_shell(cmd: str) -> None:
+            return None
+
+        self.assertEqual(self.client.run_shell("", shell=void_shell, stdin=DEVNULL), 0)
+        self.assertEqual(self.client.run_shell("", stdin=DEVNULL), 0)
+
+        for preset in (
+            SHELL_AUTO,
+            SHELL_SH,
+            SHELL_BASH,
+            SHELL_PWSH,
+            SHELL_POWERSHELL,
+            SHELL_CMD,
+        ):
+            job = serialize_callable(preset, ("echo hi",), {}, mode="call", serializer="json")
+            self.assertEqual(job["kind"], "source")
+            self.assertEqual(job["imports"], [])
+            self.assertEqual(job["bindings"], {})
+
+        if sys.platform == "win32":
+            self.assertEqual(self.client.run_shell("", shell=SHELL_CMD, stdin=DEVNULL), 0)
+            with self.assertRaises(RemoteError) as cmd_err:
+                self.client.run_shell("echo a\necho b", shell=SHELL_CMD, stdin=DEVNULL)
+            self.assertEqual(cmd_err.exception.exc_type, "ValueError")
+
+        def read_stdin() -> str:
+            import sys
+
+            return sys.stdin.read()
+
+        self.assertEqual(self.client.call_with(read_stdin), "")
+        self.assertEqual(
+            self.client.call_with(read_stdin, stdin=io.BytesIO(b"rpc-stdin")),
+            "rpc-stdin",
+        )
+        self.assertEqual(
+            self.client.call_with(read_stdin, stdin=io.BytesIO(b"ignored"), forward_stdin=False),
+            "",
+        )
+
+        # Closed file object as stdin must not hang
+        with tempfile.TemporaryFile() as closed_f:
+            closed_f.close()
+            closed_out = io.StringIO()
+            self.assertEqual(
+                self.client.run_exec(
+                    [sys.executable, "-c", "import sys; print(repr(sys.stdin.read()))"],
+                    stdin=closed_f,
+                    stdout=closed_out,
+                ),
+                0,
+            )
+            self.assertEqual(closed_out.getvalue().strip(), "''")
+
+        # capture_shell / capture_exec helpers
+        rc_cap, cap_out, cap_err = self.client.capture_shell("echo cap-ok")
+        self.assertEqual(rc_cap, 0)
+        self.assertEqual(cap_out.strip(), "cap-ok")
+        self.assertEqual(cap_err, "")
+
+        rc_ex, ex_out, ex_err = self.client.capture_exec(
+            [
+                sys.executable,
+                "-c",
+                "import sys; print('in:' + sys.stdin.read()); print('e1', file=sys.stderr); sys.exit(4)",
+            ],
+            stdin="abc",
+        )
+        self.assertEqual(rc_ex, 4)
+        self.assertEqual(ex_out.strip(), "in:abc")
+        self.assertEqual(ex_err.strip(), "e1")
+
+        # Write-only stdin, Path cwd, non-sequence run_cmd, and minimal write-only sink
+        class _WriteOnlySink:
+            def __init__(self) -> None:
+                self.parts: list[str] = []
+
+            def write(self, data: str) -> int:
+                self.parts.append(data)
+                return len(data)
+
+        sink = _WriteOnlySink()
+        self.assertEqual(
+            self.client.run_exec(
+                [sys.executable, "-c", "print('sink-ok')"],
+                stdin=DEVNULL,
+                stdout=sink,
+            ),
+            0,
+        )
+        self.assertEqual("".join(sink.parts).strip(), "sink-ok")
+
+        with tempfile.TemporaryFile("wb") as wo_file:
+            with self.assertRaises(TypeError):
+                self.client.run_exec([sys.executable, "-c", "pass"], stdin=wo_file)
+
+        with self.assertRaises(TypeError):
+            self.client.run_shell("echo hi", cwd=Path("/tmp"))  # type: ignore[arg-type]
+        with self.assertRaises(TypeError):
+            self.client.run_cmd("echo hi")  # type: ignore[arg-type]
+
+        # bytearray, memoryview, and StringIO as stdin
+        mv_out = io.StringIO()
+        self.assertEqual(
+            self.client.run_exec(
+                [sys.executable, "-c", "import sys; print(sys.stdin.read())"],
+                stdin=memoryview(b"mv-ok"),
+                stdout=mv_out,
+            ),
+            0,
+        )
+        self.assertEqual(mv_out.getvalue().strip(), "mv-ok")
+
+        sio_rc, sio_out, _ = self.client.capture_exec(
+            [sys.executable, "-c", "import sys; print(sys.stdin.read())"],
+            stdin=io.StringIO("sio-ok"),
+        )
+        self.assertEqual(sio_rc, 0)
+        self.assertEqual(sio_out.strip(), "sio-ok")
+
+        # run_cmd with stdin=DEVNULL closes stdin without hanging
+        cmd_eof_out = io.StringIO()
+        self.assertEqual(
+            self.client.run_cmd(
+                [sys.executable, "-c", "import sys; print(repr(sys.stdin.read()))"],
+                stdin=DEVNULL,
+                stdout=cmd_eof_out,
+            ),
+            0,
+        )
+        self.assertEqual(cmd_eof_out.getvalue().strip(), "''")
+
+        if sys.platform == "win32":
+            rc_q, out_q, _ = self.client.capture_shell('echo "a & b"')
+            self.assertEqual(rc_q, 0)
+            self.assertIn("a & b", out_q)
+
+        # Frozen LD_LIBRARY_PATH cleanup in _clean_child_env
+        old_frozen = getattr(sys, "frozen", False)
+        sys.frozen = True  # type: ignore[attr-defined]
+        try:
+            cleaned_orig = _clean_child_env(
+                {"LD_LIBRARY_PATH": "/meipass", "LD_LIBRARY_PATH_ORIG": "/orig", "SIMPYREMOTE_SECRET": "x"},
+                is_worker=False,
+            )
+            if sys.platform != "win32":
+                self.assertEqual(cleaned_orig["LD_LIBRARY_PATH"], "/orig")
+                self.assertNotIn("LD_LIBRARY_PATH_ORIG", cleaned_orig)
+            self.assertNotIn("SIMPYREMOTE_SECRET", cleaned_orig)
+        finally:
+            if old_frozen:
+                sys.frozen = old_frozen  # type: ignore[attr-defined]
+            else:
+                delattr(sys, "frozen")
 
     def test_call_rpc_stateless_and_stdout_isolation(self) -> None:
         def get_cwd_after_chdir(target: str) -> str:
@@ -658,6 +1134,19 @@ class SimpyRemoteTests(unittest.TestCase):
             self.assertEqual(
                 (local_back / "pkg_dir" / "sub" / "b.txt").read_text(encoding="utf-8"), "beta"
             )
+
+            with self.assertRaises(FileNotFoundError):
+                self.client.pull(str(root / "missing_remote_file.bin"), root / "nope.bin")
+            with self.assertRaises(IsADirectoryError):
+                self.client.pull(str(remote_dst / "pkg_dir"), root / "nope_dir", recursive=False)
+            with self.assertRaises(TypeError):
+                self.client.push(src_file, remote_file)  # type: ignore[arg-type]
+            with self.assertRaises(TypeError):
+                self.client.pull(remote_file, pulled_file)  # type: ignore[arg-type]
+            with self.assertRaises(ValueError):
+                _raise_transfer_error(json.dumps({"error": "bad", "exc_type": "ValueError"}).encode())
+            with self.assertRaises(RuntimeError):
+                _raise_transfer_error(b"plain non-json error")
 
     def test_signal_interrupt_terminates_remote_process(self) -> None:
         ctx = build_client_ssl_context(derive_psk(self.secret))
@@ -1016,10 +1505,29 @@ class SimpyRemoteTests(unittest.TestCase):
             try:
                 os.chdir(tmp)
                 self.assertEqual(call(lambda n: n * 2, 21), 42)
+                self.assertEqual(call_with(lambda n: n * 2, args=(21,), serializer="pickle"), 42)
                 buf = io.StringIO()
-                with redirect_stdout(buf):
-                    self.assertEqual(run(lambda: print(__name__)), 0)
-                self.assertEqual(buf.getvalue().strip(), "__main__")
+                self.assertEqual(
+                    run_shell("echo top-shell", stdout=buf, stdin=DEVNULL),
+                    0,
+                )
+                self.assertEqual(buf.getvalue().strip(), "top-shell")
+                exec_buf = io.StringIO()
+                self.assertEqual(
+                    run_exec(
+                        [sys.executable, "-c", "print('top-exec')"],
+                        stdout=exec_buf,
+                        stdin=DEVNULL,
+                    ),
+                    0,
+                )
+                self.assertEqual(exec_buf.getvalue().strip(), "top-exec")
+                rc_cs, cs_out, _ = capture_shell("echo top-cap-shell")
+                self.assertEqual(rc_cs, 0)
+                self.assertEqual(cs_out.strip(), "top-cap-shell")
+                rc_ce, ce_out, _ = capture_exec([sys.executable, "-c", "print('top-cap-exec')"])
+                self.assertEqual(rc_ce, 0)
+                self.assertEqual(ce_out.strip(), "top-cap-exec")
                 src = Path(tmp) / "top.txt"
                 dst = Path(tmp) / "top_up.txt"
                 back = Path(tmp) / "top_down.txt"
@@ -1072,15 +1580,23 @@ class SingleFileDistributionTests(unittest.TestCase):
                         sys.executable,
                         "-c",
                         (
-                            f"import sys; sys.path.insert(0, {str(dist_py.parent)!r}); "
-                            f"from simpyremote import Client; "
+                            f"import io, sys; sys.path.insert(0, {str(dist_py.parent)!r}); "
+                            f"import simpyremote; "
+                            f"from simpyremote import Client, DEVNULL, SHELL_AUTO; "
                             f"c = Client(remote='127.0.0.1:{bound_port}', auth={secret!r}); "
-                            f"print(c.call(lambda: __name__))"
+                            f"out = io.StringIO(); "
+                            f"rc = c.run_shell('echo amalg', shell=SHELL_AUTO, stdout=out, stdin=DEVNULL); "
+                            f"print(c.call(lambda: __name__), rc, out.getvalue().strip(), len(simpyremote.__all__))"
                         ),
                     ],
                     text=True,
                 )
-                self.assertEqual(out.strip(), "__main__")
+                import simpyremote as pkg_simpyremote
+
+                self.assertEqual(
+                    out.strip(),
+                    f"__main__ 0 amalg {len(pkg_simpyremote.__all__)}",
+                )
             finally:
                 proc.terminate()
                 proc.wait(timeout=5)

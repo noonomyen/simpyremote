@@ -175,13 +175,13 @@ def resolve_client_config(
         final_port = validate_port(port) if port is not None else parsed_port
     else:
         raise ValueError(
-            "Missing remote target: pass --remote host:port or configure .simpyremote"
+            "Missing remote target: pass --remote host:port, Client(remote=...), or configure .simpyremote"
         )
 
     secret = explicit_secret or rc.get("secret")
     if not secret:
         raise ValueError(
-            "Missing auth secret: pass --auth, set SIMPYREMOTE_SECRET, or configure .simpyremote"
+            "Missing auth secret: pass --auth, Client(auth=...), set SIMPYREMOTE_SECRET, or configure .simpyremote"
         )
     rc_ignore = _extract_rc_ignore_warnings(rc)
     final_ignore = bool(rc_ignore) if ignore_warnings is None else bool(ignore_warnings)

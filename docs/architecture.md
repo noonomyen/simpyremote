@@ -65,15 +65,15 @@ sequenceDiagram
 
 | Hex | Name | Direction | Payload |
 | :--- | :--- | :--- | :--- |
-| `0x01` | `FRAME_EXEC_CMD` | C -> S | JSON `{argv, cwd, pty, cols, rows, term}` |
-| `0x02` | `FRAME_EXEC_PY` | C -> S | JSON serialized callable job (`source`, `code`, or `builtin`) |
+| `0x01` | `FRAME_EXEC_CMD` | C -> S | JSON `{argv, cwd, pty, cols, rows, term, close_stdin}` |
+| `0x02` | `FRAME_EXEC_PY` | C -> S | JSON serialized callable job (`source`, `code`, or `builtin`, plus optional `cwd` and `close_stdin`) |
 | `0x03` | `FRAME_STDIN` | C -> S | Raw stdin bytes |
 | `0x04` | `FRAME_STDIN_EOF` | C -> S | Empty (closes remote pipe stdin) |
 | `0x05` | `FRAME_STDOUT` | S -> C | Raw stdout bytes (or combined PTY stream) |
 | `0x06` | `FRAME_STDERR` | S -> C | Raw stderr bytes (pipe mode only) |
 | `0x07` | `FRAME_SIGNAL` | C -> S | UTF-8 signal name (`INT`, `TERM`, `KILL`) |
 | `0x08` | `FRAME_EXIT` | S -> C | JSON `{returncode}` |
-| `0x09` | `FRAME_ERROR` | S -> C | JSON `{error}` |
+| `0x09` | `FRAME_ERROR` | S -> C | JSON `{error}` (plus optional `exc_type` for file transfer errors) |
 | `0x0A` | `FRAME_RETURN` | S -> C | JSON `{ok, serializer, value}` or `{ok: false, exc_type, error, traceback}` |
 | `0x0B` | `FRAME_STARTED` | S -> C | JSON `{pid, pty}` |
 | `0x0C` | `FRAME_CONTROL` | Local | Loopback worker control channel (token auth, job payload, return payload) |
@@ -132,7 +132,7 @@ sequenceDiagram
     Note over C: Restore terminal mode before returning rc
 ```
 
-### 4.2 Stateless Python Execution (`run()` and `call()`)
+### 4.2 Stateless Python Execution (`call()`, `run_shell()`, and `run_exec()`)
 
 To keep return values isolated from arbitrary user `print()` output and isolate global state/crashes per call, the server spawns a fresh OS worker process (`python -P ... --_worker` or `<frozen-binary> --_worker`) connected over an authenticated loopback control channel:
 
@@ -192,4 +192,4 @@ sequenceDiagram
 | **Local raw terminal** | `termios.tcgetattr` / `tty.setraw` + `SIGWINCH` | `SetConsoleMode` (`ENABLE_WINDOW_INPUT` + `ENABLE_VIRTUAL_TERMINAL_PROCESSING`) + non-blocking `ReadConsoleInputW` (UTF-8 + VT keys + `WINDOW_BUFFER_SIZE_EVENT`) |
 | **Stdin forwarding** | `selectors.DefaultSelector` + wakeup `os.pipe()` | `PeekNamedPipe` (pipes), `ReadConsoleInputW` (raw console), `WaitForSingleObject` + `kbhit()` (cooked console), `msvcrt.setmode` restored on exit |
 | **Signal delivery** | `start_new_session=True` + `os.killpg()` | Pipe mode: `CREATE_NEW_PROCESS_GROUP` + `CTRL_BREAK_EVENT` (mapped to `KeyboardInterrupt` in `--_worker`); ConPTY: `\x03` to stdin for `INT`, `TerminateProcess` for `TERM`/`KILL` |
-| **Default shell** | `$SHELL` or `/bin/sh` | `powershell.exe -NoLogo`, `$COMSPEC`, or `cmd.exe` |
+| **Default shell** | `$SHELL` or `/bin/sh` | `powershell.exe -NoLogo`, `pwsh -NoLogo` (preferred on Wine if installed), `$COMSPEC`, or `cmd.exe` |
