@@ -1,4 +1,5 @@
 import hmac
+import itertools
 import json
 import os
 import queue
@@ -12,6 +13,7 @@ import threading
 import time
 from collections.abc import Callable
 from contextlib import suppress
+from datetime import datetime
 from typing import Any
 
 from .config import DEFAULT_BIND, DEFAULT_PORT, resolve_server_secret
@@ -60,6 +62,74 @@ MAX_PENDING_STDIN_BYTES = 4 * 1024 * 1024
 _ERROR_SEND_TIMEOUT = 5.0
 _CTL_AUTH_TIMEOUT = 2.0
 _CTL_MAX_TOKEN_BYTES = 128
+_LOG_VALUE_MAX_LEN = 200
+
+
+def _format_peer(peer: tuple[Any, ...]) -> str:
+    if len(peer) >= 2:
+        host, port = peer[0], peer[1]
+        return f"[{host}]:{port}" if ":" in str(host) else f"{host}:{port}"
+    return str(peer)
+
+
+def _format_log_value(val: Any) -> str:
+    if val is None or isinstance(val, (bool, int, float)):
+        return str(val)
+    if isinstance(val, str):
+        clipped = val if len(val) <= _LOG_VALUE_MAX_LEN else val[: _LOG_VALUE_MAX_LEN - 3] + "..."
+        return repr(clipped)
+    text = repr(val)
+    if len(text) > _LOG_VALUE_MAX_LEN:
+        return text[: _LOG_VALUE_MAX_LEN - 3] + "..."
+    return text
+
+
+def _elapsed_ms(started_at: float) -> int:
+    return max(0, int((time.monotonic() - started_at) * 1000))
+
+
+def _py_fn_label(job: dict[str, Any]) -> str:
+    if job.get("kind") == "builtin":
+        mod = job.get("module")
+        qual = job.get("qualname")
+        if mod and qual:
+            return f"{mod}.{qual}"
+    return str(job.get("func_name") or "<unknown>")
+
+
+class _ServerLogger:
+    """Thread-safe stderr logger for server lifecycle and request events."""
+
+    def __init__(self, enabled: bool) -> None:
+        self.enabled = enabled
+        self._lock = threading.Lock()
+        self._counter = itertools.count(1)
+
+    def next_id(self) -> int:
+        if not self.enabled:
+            return 0
+        with self._lock:
+            return next(self._counter)
+
+    def log(self, scope: str, action: str, **fields: Any) -> None:
+        if not self.enabled:
+            return
+        stream = sys.stderr
+        if stream is None:
+            return
+        ts = datetime.now().isoformat(sep=" ", timespec="milliseconds")
+        if fields:
+            detail = " ".join(f"{k}={_format_log_value(v)}" for k, v in fields.items())
+            line = f"[{ts}] [{scope}] {action} {detail}\n"
+        else:
+            line = f"[{ts}] [{scope}] {action}\n"
+        with self._lock:
+            stream = sys.stderr
+            if stream is None:
+                return
+            with suppress(OSError, ValueError):
+                stream.write(line)
+                stream.flush()
 
 
 def _send_error_bounded(tls_sock: ssl.SSLSocket, message: str) -> None:
@@ -161,6 +231,9 @@ def _setup_worker_control(
     job_payload: bytes,
     mode: str,
     tls_sock: ssl.SSLSocket,
+    *,
+    logger: _ServerLogger | None = None,
+    log_scope: str = "server",
 ) -> tuple[bool, list[bytes], threading.Thread | None]:
     ctl_result: list[bytes] = []
     ctl_conn: socket.socket | None = None
@@ -170,10 +243,20 @@ def _setup_worker_control(
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
+                if logger is not None:
+                    logger.log(log_scope, "WORKER_ABORT", pid=proc.pid, reason="control_timeout")
                 _abort_worker(proc, tls_sock, "Worker failed to connect control channel (timeout)")
                 return False, ctl_result, None
             rc_now = proc.poll()
             if rc_now is not None:
+                if logger is not None:
+                    logger.log(
+                        log_scope,
+                        "WORKER_ABORT",
+                        pid=proc.pid,
+                        reason="premature_exit",
+                        rc=rc_now,
+                    )
                 _abort_worker(
                     proc,
                     tls_sock,
@@ -240,7 +323,11 @@ def _run_process_session(
     rows: int = 24,
     term: str | None = None,
     close_stdin: bool = False,
+    logger: _ServerLogger | None = None,
+    log_scope: str = "server",
+    req_started: float | None = None,
 ) -> None:
+    t0 = time.monotonic() if req_started is None else req_started
     is_worker = job_payload is not None
     proc_env = _clean_child_env(env, is_worker=is_worker)
     ctl_srv: socket.socket | None = None
@@ -266,6 +353,13 @@ def _run_process_session(
         if ctl_srv is not None:
             with suppress(OSError):
                 ctl_srv.close()
+        if logger is not None:
+            logger.log(
+                log_scope,
+                "SPAWN_FAILED",
+                error=str(exc),
+                duration_ms=_elapsed_ms(t0),
+            )
         _send_error_bounded(tls_sock, f"Failed to spawn process: {exc}")
         return
 
@@ -273,10 +367,21 @@ def _run_process_session(
     ctl_thread: threading.Thread | None = None
     if ctl_srv is not None and job_payload is not None:
         ok, ctl_result, ctl_thread = _setup_worker_control(
-            proc, ctl_srv, ctl_token, job_payload, mode, tls_sock
+            proc,
+            ctl_srv,
+            ctl_token,
+            job_payload,
+            mode,
+            tls_sock,
+            logger=logger,
+            log_scope=log_scope,
         )
         if not ok:
             return
+        if logger is not None:
+            logger.log(log_scope, "WORKER_SPAWN", pid=proc.pid)
+    elif logger is not None:
+        logger.log(log_scope, "SPAWN", pid=proc.pid, pty=proc.is_pty)
 
     session = FramedTLSSession(tls_sock)
     stdin_q: queue.SimpleQueue[bytes | None] = queue.SimpleQueue()
@@ -322,6 +427,24 @@ def _run_process_session(
             ctl_thread.join()
             if ctl_result:
                 session.enqueue_frame(FRAME_RETURN, ctl_result[0])
+        if logger is not None:
+            if is_worker:
+                logger.log(
+                    log_scope,
+                    "EXIT",
+                    pid=proc.pid,
+                    rc=rc,
+                    has_return=bool(ctl_result),
+                    duration_ms=_elapsed_ms(t0),
+                )
+            else:
+                logger.log(
+                    log_scope,
+                    "EXIT",
+                    pid=proc.pid,
+                    rc=rc,
+                    duration_ms=_elapsed_ms(t0),
+                )
         session.enqueue_json(FRAME_EXIT, {"returncode": rc})
         session.finish_tx()
 
@@ -332,6 +455,13 @@ def _run_process_session(
             if not stdin_closed.is_set():
                 with stdin_lock:
                     if pending_stdin[0] + len(payload) > MAX_PENDING_STDIN_BYTES:
+                        if logger is not None:
+                            logger.log(
+                                log_scope,
+                                "STDIN_LIMIT_EXCEEDED",
+                                pid=proc.pid,
+                                limit=MAX_PENDING_STDIN_BYTES,
+                            )
                         _close_stdin_queue()
                         session.send_from_loop(
                             FRAME_ERROR,
@@ -347,6 +477,8 @@ def _run_process_session(
             _close_stdin_queue()
         elif msg_type == FRAME_SIGNAL:
             sig_name = payload.decode("utf-8", errors="replace").strip() or "INT"
+            if logger is not None:
+                logger.log(log_scope, "SIGNAL", pid=proc.pid, sig=sig_name)
             deliver_signal_to_process(proc, sig_name)
         elif msg_type == FRAME_RESIZE:
             try:
@@ -359,7 +491,16 @@ def _run_process_session(
             proc.resize(c, r)
         return True
 
+    detach_logged = False
+
+    def _log_detach_if_running() -> None:
+        nonlocal detach_logged
+        if not detach_logged and logger is not None and proc.poll() is None:
+            detach_logged = True
+            logger.log(log_scope, "CLIENT_DETACH", pid=proc.pid, duration_ms=_elapsed_ms(t0))
+
     def _on_eof() -> bool:
+        _log_detach_if_running()
         _close_stdin_queue()
         return False
 
@@ -372,6 +513,7 @@ def _run_process_session(
         t_wait.start()
         session.run(_on_frame, on_eof=_on_eof)
     except (OSError, ValueError):
+        _log_detach_if_running()
         _close_stdin_queue()
     finally:
         session.closed.set()
@@ -383,12 +525,44 @@ def _run_process_session(
         session.close()
 
 
+def _log_transfer_result(
+    logger: _ServerLogger,
+    scope: str,
+    prefix: str,
+    result: tuple[bool, str, int, str | None],
+    err_key: str,
+    started_at: float,
+) -> None:
+    ok, path_str, size, err = result
+    if ok:
+        logger.log(
+            scope,
+            f"{prefix}_DONE",
+            path=path_str,
+            bytes=size,
+            duration_ms=_elapsed_ms(started_at),
+        )
+    else:
+        logger.log(
+            scope,
+            f"{prefix}_ERROR",
+            **{err_key: path_str},
+            error=err,
+            duration_ms=_elapsed_ms(started_at),
+        )
+
+
 def _handle_client(
     raw_sock: socket.socket,
     peer: tuple[Any, ...],
     ssl_ctx: ssl.SSLContext,
     sem: threading.BoundedSemaphore,
+    logger: _ServerLogger | None = None,
+    req_id: int = 0,
 ) -> None:
+    active_logger = logger if logger is not None else _ServerLogger(False)
+    scope = f"#{req_id} {_format_peer(peer)}"
+    started_at = time.monotonic()
     tls_sock: ssl.SSLSocket | None = None
     try:
         with suppress(OSError):
@@ -399,6 +573,7 @@ def _handle_client(
         tls_sock.settimeout(INITIAL_FRAME_TIMEOUT)
         first = recv_frame(tls_sock)
         if first is None:
+            active_logger.log(scope, "EOF_BEFORE_REQ", duration_ms=_elapsed_ms(started_at))
             return
         tls_sock.settimeout(None)
 
@@ -414,40 +589,114 @@ def _handle_client(
             )
             term_val = req.get("term")
             term = str(term_val) if isinstance(term_val, str) and term_val else None
+            use_pty = bool(req.get("pty", False))
+            cwd = req.get("cwd")
+            active_logger.log(scope, "EXEC_CMD", argv=argv, pty=use_pty, cwd=cwd)
             _run_process_session(
                 tls_sock,
                 argv,
-                cwd=req.get("cwd"),
+                cwd=cwd,
                 mode="run",
-                use_pty=bool(req.get("pty", False)),
+                use_pty=use_pty,
                 cols=cols,
                 rows=rows,
                 term=term,
                 close_stdin=bool(req.get("close_stdin", False)),
+                logger=active_logger,
+                log_scope=scope,
+                req_started=started_at,
             )
         elif msg_type == FRAME_EXEC_PY:
             job = json.loads(payload.decode("utf-8"))
+            mode = str(job.get("mode", "run"))
+            cwd = job.get("cwd")
+            active_logger.log(
+                scope,
+                "EXEC_PY",
+                mode=mode,
+                kind=job.get("kind"),
+                fn=_py_fn_label(job),
+                serializer=job.get("serializer", "json"),
+                cwd=cwd,
+            )
             cmd, env = _worker_cmd_and_env()
             _run_process_session(
                 tls_sock,
                 cmd,
                 env=env,
-                cwd=job.get("cwd"),
+                cwd=cwd,
                 job_payload=payload,
-                mode=str(job.get("mode", "run")),
+                mode=mode,
                 close_stdin=bool(job.get("close_stdin", False)),
+                logger=active_logger,
+                log_scope=scope,
+                req_started=started_at,
             )
         elif msg_type == FRAME_FILE_PUT:
+            meta = json.loads(payload.decode("utf-8"))
+            active_logger.log(
+                scope,
+                "FILE_PUT_START",
+                dst=meta.get("dst") if isinstance(meta, dict) else None,
+                name=meta.get("name") if isinstance(meta, dict) else None,
+                is_dir=bool(meta.get("is_dir", False)) if isinstance(meta, dict) else False,
+            )
             tls_sock.settimeout(TRANSFER_IDLE_TIMEOUT)
-            server_handle_file_put(tls_sock, json.loads(payload.decode("utf-8")))
+            _log_transfer_result(
+                active_logger,
+                scope,
+                "FILE_PUT",
+                server_handle_file_put(tls_sock, meta),
+                "dst",
+                started_at,
+            )
         elif msg_type == FRAME_FILE_GET:
+            req = json.loads(payload.decode("utf-8"))
+            active_logger.log(
+                scope,
+                "FILE_GET_START",
+                src=req.get("src") if isinstance(req, dict) else None,
+                recursive=bool(req.get("recursive", False)) if isinstance(req, dict) else False,
+            )
             tls_sock.settimeout(TRANSFER_IDLE_TIMEOUT)
-            server_handle_file_get(tls_sock, json.loads(payload.decode("utf-8")))
+            _log_transfer_result(
+                active_logger,
+                scope,
+                "FILE_GET",
+                server_handle_file_get(tls_sock, req),
+                "src",
+                started_at,
+            )
         else:
+            active_logger.log(
+                scope,
+                "UNKNOWN_FRAME",
+                msg_type=msg_type,
+                duration_ms=_elapsed_ms(started_at),
+            )
             _send_error_bounded(tls_sock, f"Unknown initial frame: {msg_type}")
     except (ssl.SSLError, TimeoutError) as exc:
-        print(f"[simpyremote] auth/tls rejected from {peer[0]}: {exc}", file=sys.stderr)
+        if active_logger.enabled:
+            if tls_sock is None:
+                action = "TLS_TIMEOUT" if isinstance(exc, TimeoutError) else "TLS_REJECTED"
+            else:
+                action = "REQ_TIMEOUT" if isinstance(exc, TimeoutError) else "TLS_ERROR"
+            active_logger.log(
+                scope,
+                action,
+                error=str(exc),
+                duration_ms=_elapsed_ms(started_at),
+            )
+        else:
+            print(f"[simpyremote] auth/tls rejected from {peer[0]}: {exc}", file=sys.stderr)
     except Exception as exc:
+        active_logger.log(
+            scope,
+            "REQ_ERROR",
+            exc_type=type(exc).__name__,
+            error=str(exc),
+            duration_ms=_elapsed_ms(started_at),
+        )
         if tls_sock is not None:
             _send_error_bounded(tls_sock, str(exc))
     finally:
@@ -476,6 +725,7 @@ def serve(
     stop_event: threading.Event | None = None,
     on_listening: Any = None,
     ignore_warnings: bool = False,
+    log: bool = False,
 ) -> None:
     """Run the TLS 1.3 PSK remote execution server."""
     if not (0 <= port <= 65535):
@@ -485,6 +735,7 @@ def serve(
         warn_if_weak_secret(secret)
     ssl_ctx = build_server_ssl_context(derive_psk(secret))
     sem = threading.BoundedSemaphore(MAX_CONCURRENT_SESSIONS)
+    logger = _ServerLogger(log)
 
     family, dualstack = _resolve_bind_family(host, port)
     with socket.create_server(
@@ -510,6 +761,12 @@ def serve(
                 file=sys.stderr,
                 flush=True,
             )
+        logger.log(
+            "server",
+            "LISTENING",
+            addr=display_addr,
+            auth="generated" if generated else "configured",
+        )
 
         try:
             while stop_event is None or not stop_event.is_set():
@@ -518,12 +775,20 @@ def serve(
                 except TimeoutError:
                     continue
                 if not sem.acquire(blocking=False):
+                    logger.log(
+                        "server",
+                        "CONN_REJECTED",
+                        peer=_format_peer(peer),
+                        reason="max_concurrent_sessions",
+                        limit=MAX_CONCURRENT_SESSIONS,
+                    )
                     conn.close()
                     continue
                 try:
+                    req_id = logger.next_id()
                     threading.Thread(
                         target=_handle_client,
-                        args=(conn, peer, ssl_ctx, sem),
+                        args=(conn, peer, ssl_ctx, sem, logger, req_id),
                         daemon=True,
                     ).start()
                 except Exception:
@@ -533,3 +798,5 @@ def serve(
                     raise
         except KeyboardInterrupt:
             pass
+        finally:
+            logger.log("server", "STOPPED", addr=display_addr)

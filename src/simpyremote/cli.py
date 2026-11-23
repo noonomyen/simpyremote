@@ -68,6 +68,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Suppress non-fatal security warnings (short secret, .simpyremote permissions)",
     )
+    parser.add_argument(
+        "--log",
+        action="store_true",
+        help="Print timestamped server request and lifecycle logs to stderr",
+    )
     pty_group = parser.add_mutually_exclusive_group()
     pty_group.add_argument(
         "-t",
@@ -115,6 +120,7 @@ def main(argv: list[str] | None = None) -> int:
                 port=port,
                 pre_auth=args.pre_auth,
                 ignore_warnings=args.ignore_warnings,
+                log=args.log,
             )
         except (OSError, ValueError, RuntimeError) as exc:
             print(f"[simpyremote] error: {exc}", file=sys.stderr)
@@ -123,6 +129,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.pre_auth is not None:
         parser.error("--pre-auth is only valid with --server")
+    if args.log:
+        parser.error("--log is only valid with --server")
     if args.push and args.pull:
         parser.error("cannot use --push and --pull together")
     if (args.push or args.pull) and cmd_argv is not None:

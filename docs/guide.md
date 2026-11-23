@@ -46,13 +46,14 @@ On POSIX systems, `.simpyremote` files owned by another user or writable by grou
 ### Server Mode
 
 ```bash
-simpyremote --server [HOST] [--port PORT] [--pre-auth SECRET] [--ignore-warnings]
+simpyremote --server [HOST] [--port PORT] [--pre-auth SECRET] [--ignore-warnings] [--log]
 ```
 
 - `--server [HOST]`: Bind host/IP only (never `HOST:PORT`; defaults to `127.0.0.1` if `--server` is passed without a value; use `0.0.0.0` for all IPv4 interfaces or `::` for dual-stack IPv6/IPv4).
 - `--port PORT`: TCP port (`0..65535`, default `2222`; `0` picks an ephemeral OS port).
 - `--pre-auth SECRET`: Pre-shared secret (overrides `SIMPYREMOTE_SECRET`).
 - `--ignore-warnings`: Suppress non-fatal security warnings (short secret, `.simpyremote` permissions).
+- `--log`: Print timestamped server lifecycle and per-request logs to `stderr` (never writes log files).
 
 ### Client Mode
 
@@ -146,7 +147,7 @@ remote_path, nbytes = client.push("./folder", "/tmp/dest", recursive=True)
 local_path, nbytes = client.pull("/tmp/dest/folder", "./local_dest", recursive=True)
 
 # Embed a server in Python (port=0 picks an ephemeral port)
-# serve(host="127.0.0.1", port=2222, pre_auth=None, stop_event=ev, on_listening=cb, ignore_warnings=False)
+# serve(host="127.0.0.1", port=2222, pre_auth=None, stop_event=ev, on_listening=cb, ignore_warnings=False, log=False)
 ```
 
 ### How Function Serialization Works

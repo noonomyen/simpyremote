@@ -6,6 +6,7 @@ import json
 import math
 import os
 import pickle
+import re
 import shutil
 import socket
 import ssl
@@ -17,7 +18,7 @@ import tempfile
 import threading
 import time
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout, suppress
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
@@ -72,7 +73,12 @@ from simpyremote.serialize import (
     _is_json_primitive,
     serialize_callable,
 )
-from simpyremote.server import _clean_child_env
+from simpyremote.server import (
+    _clean_child_env,
+    _format_log_value,
+    _py_fn_label,
+    _ServerLogger,
+)
 from simpyremote.tls import (
     build_client_ssl_context,
     build_server_ssl_context,
@@ -1558,6 +1564,328 @@ class SimpyRemoteTests(unittest.TestCase):
                     os.environ["SIMPYREMOTE_SECRET"] = old_env
                 if old_cfg is not None:
                     os.environ["SIMPYREMOTE_CONFIG"] = old_cfg
+
+
+class _LockedStderr:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._buf = io.StringIO()
+
+    def write(self, data: str) -> int:
+        with self._lock:
+            return self._buf.write(data)
+
+    def flush(self) -> None:
+        pass
+
+    def getvalue(self) -> str:
+        with self._lock:
+            return self._buf.getvalue()
+
+
+class ServerLoggingTests(unittest.TestCase):
+    def _wait_for_log(self, buf: _LockedStderr, needle: str, timeout: float = 2.0) -> None:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if needle in buf.getvalue():
+                return
+            time.sleep(0.01)
+        self.fail(f"Timed out waiting for log entry {needle!r}; got:\n{buf.getvalue()}")
+
+    def test_logger_helpers_and_broken_stderr_safety(self) -> None:
+        self.assertEqual(_py_fn_label({"kind": "builtin", "module": "os", "qualname": "getcwd"}), "os.getcwd")
+        self.assertEqual(_py_fn_label({"kind": "code", "func_name": "dyn_fn"}), "dyn_fn")
+        self.assertEqual(_py_fn_label({"kind": "source"}), "<unknown>")
+
+        long_val = "x" * 250
+        clipped = _format_log_value(long_val)
+        self.assertTrue(clipped.endswith("...'"))
+        self.assertLessEqual(len(clipped), 205)
+
+        logger = _ServerLogger(True)
+        with redirect_stderr(None):  # type: ignore[arg-type]
+            logger.log("server", "NO_STDERR", key="val")
+
+        class _BrokenStream:
+            def write(self, _data: str) -> int:
+                raise BrokenPipeError("pipe closed")
+
+            def flush(self) -> None:
+                raise BrokenPipeError("pipe closed")
+
+        with redirect_stderr(_BrokenStream()):  # type: ignore[arg-type]
+            logger.log("server", "BROKEN_STDERR", key="val")
+
+        disabled = _ServerLogger(False)
+        self.assertEqual(disabled.next_id(), 0)
+
+    def test_serve_log_disabled_produces_no_request_logs(self) -> None:
+        secret = "server_log_disabled_secret_123456"
+        stop = threading.Event()
+        ready = threading.Event()
+        bound: list[int] = []
+        err_buf = _LockedStderr()
+
+        def _on_listen(_h: str, p: int, _s: str, _g: bool) -> None:
+            bound.append(p)
+            ready.set()
+
+        with redirect_stderr(err_buf):  # type: ignore[arg-type]
+            srv_thread = threading.Thread(
+                target=serve,
+                kwargs={
+                    "host": "127.0.0.1",
+                    "port": 0,
+                    "pre_auth": secret,
+                    "stop_event": stop,
+                    "on_listening": _on_listen,
+                    "log": False,
+                },
+                daemon=True,
+            )
+            srv_thread.start()
+            try:
+                self.assertTrue(ready.wait(timeout=5.0))
+                client = Client(remote=f"127.0.0.1:{bound[0]}", auth=secret)
+                self.assertEqual(client.call(lambda: 7), 7)
+            finally:
+                stop.set()
+                srv_thread.join(timeout=5.0)
+                self.assertFalse(srv_thread.is_alive())
+
+        self.assertEqual(err_buf.getvalue(), "")
+
+    def test_cli_log_flag_requires_server_and_emits_logs(self) -> None:
+        with self.assertRaises(SystemExit) as cm:
+            cli_main(["--log", "--", "echo", "hi"])
+        self.assertEqual(cm.exception.code, 2)
+
+        cli_entry = "import sys; from simpyremote.cli import main; sys.exit(main())"
+        sub_env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parent.parent / "src")}
+        secret = "cli_log_test_secret_1234567890"
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                cli_entry,
+                "--server",
+                "127.0.0.1",
+                "--port",
+                "0",
+                "--pre-auth",
+                secret,
+                "--log",
+            ],
+            env=sub_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            assert proc.stderr is not None
+            banner = proc.stderr.readline()
+            self.assertIn("listening on 127.0.0.1:", banner)
+            port = int(banner.split("127.0.0.1:", 1)[1].split(" ", 1)[0])
+
+            client = Client(remote=f"127.0.0.1:{port}", auth=secret)
+            rc = client.run_cmd(
+                [sys.executable, "-c", "print('hi')"],
+                pty=False,
+                stdin=DEVNULL,
+                stdout=DEVNULL,
+            )
+            self.assertEqual(rc, 0)
+        finally:
+            proc.terminate()
+            proc.wait(timeout=5)
+            assert proc.stderr is not None
+            stderr_rest = proc.stderr.read()
+            if proc.stdout is not None:
+                proc.stdout.close()
+            proc.stderr.close()
+
+        lines = [line for line in stderr_rest.splitlines() if line.strip()]
+        ts_re = re.compile(r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}\] \[.+\] [A-Z0-9_]+")
+        for line in lines:
+            self.assertRegex(line, ts_re)
+        joined = "\n".join(lines)
+        self.assertIn("[server] LISTENING", joined)
+        self.assertIn("EXEC_CMD", joined)
+        self.assertIn("SPAWN pid=", joined)
+        self.assertIn("EXIT pid=", joined)
+
+    def test_serve_logging_lifecycle_events_and_redaction(self) -> None:
+        secret = "server_log_lifecycle_secret_123456"
+        stop = threading.Event()
+        ready = threading.Event()
+        bound: list[int] = []
+        err_buf = _LockedStderr()
+
+        def _on_listen(_h: str, p: int, _s: str, _g: bool) -> None:
+            bound.append(p)
+            ready.set()
+
+        with redirect_stderr(err_buf):  # type: ignore[arg-type]
+            srv_thread = threading.Thread(
+                target=serve,
+                kwargs={
+                    "host": "127.0.0.1",
+                    "port": 0,
+                    "pre_auth": secret,
+                    "stop_event": stop,
+                    "on_listening": _on_listen,
+                    "log": True,
+                },
+                daemon=True,
+            )
+            srv_thread.start()
+            try:
+                self.assertTrue(ready.wait(timeout=5.0))
+                port = bound[0]
+                client = Client(remote=f"127.0.0.1:{port}", auth=secret)
+
+                # 1. EXEC_CMD + newline escaping (no log injection)
+                rc = client.run_cmd(
+                    [sys.executable, "-c", "print('ok')\n# FAKE_INJECTED"],
+                    pty=False,
+                    stdin=DEVNULL,
+                    stdout=DEVNULL,
+                )
+                self.assertEqual(rc, 0)
+
+                # 2. EXEC_PY call + redaction of args/bindings
+                sensitive_arg = "TOP_SECRET_ARG_VALUE_987654"
+                sensitive_binding = "TOP_SECRET_BINDING_123456"
+
+                def _secret_fn(x: str) -> int:
+                    return len(x) + len(sensitive_binding)
+
+                self.assertEqual(
+                    client.call(_secret_fn, sensitive_arg),
+                    len(sensitive_arg) + len(sensitive_binding),
+                )
+
+                # 3. FILE_PUT / FILE_PUT_ERROR / FILE_GET / FILE_GET_ERROR
+                with tempfile.TemporaryDirectory() as tmp:
+                    src = Path(tmp) / "up.bin"
+                    dst = Path(tmp) / "saved.bin"
+                    down = Path(tmp) / "down.bin"
+                    src.write_bytes(b"hello-log-transfer")
+                    client.push(src, str(dst))
+                    client.pull(str(dst), down)
+                    with self.assertRaises(FileNotFoundError):
+                        client.pull(str(Path(tmp) / "missing.bin"), down)
+
+                ctx = build_client_ssl_context(derive_psk(secret))
+                with connect_tls("127.0.0.1", port, ctx) as sock:
+                    send_json(
+                        sock,
+                        0x10,
+                        {"dst": "/tmp", "name": "../escape", "is_dir": False},
+                    )
+                    err_put = recv_frame(sock)
+                    self.assertIsNotNone(err_put)
+
+                # 4. SIGNAL
+                with connect_tls("127.0.0.1", port, ctx) as sock:
+                    send_json(
+                        sock,
+                        FRAME_EXEC_CMD,
+                        {"argv": [sys.executable, "-c", "import time; time.sleep(30)"], "pty": False},
+                    )
+                    started = recv_frame(sock)
+                    self.assertIsNotNone(started)
+                    assert started is not None
+                    self.assertEqual(started[0], FRAME_STARTED)
+                    send_frame(sock, FRAME_SIGNAL, b"KILL")
+                    while True:
+                        fr = recv_frame(sock)
+                        if fr is None or fr[0] == FRAME_EXIT:
+                            break
+
+                # 5. CLIENT_DETACH (detach while remote sleep is running, then clean up child)
+                detached_pid = None
+                with connect_tls("127.0.0.1", port, ctx) as sock:
+                    send_json(
+                        sock,
+                        FRAME_EXEC_CMD,
+                        {"argv": [sys.executable, "-c", "import time; time.sleep(10)"], "pty": False},
+                    )
+                    started = recv_frame(sock)
+                    self.assertIsNotNone(started)
+                    assert started is not None
+                    detached_pid = json.loads(started[1].decode("utf-8"))["pid"]
+                    with suppress(ssl.SSLError, OSError):
+                        sock.unwrap()
+                self._wait_for_log(err_buf, "CLIENT_DETACH")
+                if isinstance(detached_pid, int):
+                    with suppress(OSError):
+                        os.kill(detached_pid, 9)
+
+                # 6. SPAWN_FAILED
+                with connect_tls("127.0.0.1", port, ctx) as sock:
+                    send_json(
+                        sock,
+                        FRAME_EXEC_CMD,
+                        {"argv": ["nonexistent_simpyremote_binary_xyz"], "pty": False},
+                    )
+                    err_spawn = recv_frame(sock)
+                    self.assertIsNotNone(err_spawn)
+
+                # 7. EOF_BEFORE_REQ (send TLS close_notify without sending a frame)
+                with connect_tls("127.0.0.1", port, ctx) as sock:
+                    with suppress(ssl.SSLError, OSError):
+                        sock.unwrap()
+                self._wait_for_log(err_buf, "EOF_BEFORE_REQ")
+
+                # 8. UNKNOWN_FRAME
+                with connect_tls("127.0.0.1", port, ctx) as sock:
+                    send_frame(sock, 0x7F, b"bad")
+                    err_fr = recv_frame(sock)
+                    self.assertIsNotNone(err_fr)
+
+                # 9. REQ_ERROR (malformed non-dict JSON)
+                with connect_tls("127.0.0.1", port, ctx) as sock:
+                    send_frame(sock, FRAME_EXEC_CMD, b"[1, 2, 3]")
+                    err_json = recv_frame(sock)
+                    self.assertIsNotNone(err_json)
+
+                # 10. TLS_REJECTED (wrong PSK)
+                bad_ctx = build_client_ssl_context(derive_psk("wrong_secret_000000000000000000"))
+                with self.assertRaises((ssl.SSLError, EOFError, OSError)):
+                    with connect_tls("127.0.0.1", port, bad_ctx):
+                        pass
+                self._wait_for_log(err_buf, "TLS_REJECTED")
+            finally:
+                stop.set()
+                srv_thread.join(timeout=5.0)
+                self.assertFalse(srv_thread.is_alive())
+
+        logs = err_buf.getvalue()
+        self.assertIn("[server] LISTENING", logs)
+        self.assertIn("[server] STOPPED", logs)
+        self.assertIn("EXEC_CMD", logs)
+        self.assertNotIn("\nFAKE_INJECTED", logs)
+        self.assertIn("EXEC_PY mode='call' kind='source' fn='_secret_fn'", logs)
+        self.assertIn("WORKER_SPAWN pid=", logs)
+        self.assertIn("has_return=True", logs)
+        self.assertNotIn(sensitive_arg, logs)
+        self.assertNotIn(sensitive_binding, logs)
+        self.assertIn("FILE_PUT_START", logs)
+        self.assertIn("FILE_PUT_DONE", logs)
+        self.assertIn("FILE_PUT_ERROR", logs)
+        self.assertIn("bytes=18", logs)
+        self.assertIn("FILE_GET_START", logs)
+        self.assertIn("FILE_GET_DONE", logs)
+        self.assertIn("FILE_GET_ERROR", logs)
+        self.assertIn("SIGNAL pid=", logs)
+        self.assertIn("sig='KILL'", logs)
+        self.assertIn("CLIENT_DETACH", logs)
+        self.assertIn("SPAWN_FAILED", logs)
+        self.assertIn("EOF_BEFORE_REQ", logs)
+        self.assertIn("UNKNOWN_FRAME msg_type=127", logs)
+        self.assertIn("REQ_ERROR", logs)
+        self.assertIn("TLS_REJECTED", logs)
 
 
 class SingleFileDistributionTests(unittest.TestCase):

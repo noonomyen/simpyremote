@@ -333,23 +333,34 @@ def client_pull(
     return _receive_stream_to_dest(sock, os.fspath(local_dst), meta)
 
 
-def server_handle_file_put(sock: socket.socket, meta: dict[str, Any]) -> None:
-    """Receive an uploaded file/directory from a client and send DONE ack."""
+def server_handle_file_put(
+    sock: socket.socket,
+    meta: dict[str, Any],
+) -> tuple[bool, str, int, str | None]:
+    """Receive an uploaded file/directory, send DONE ack, and return (ok, path, nbytes, error)."""
+    target = str(meta.get("dst", "")) if isinstance(meta, dict) else ""
     try:
         saved_path, received = _receive_stream_to_dest(
             sock, str(meta["dst"]), meta, send_ready_ack=True
         )
         send_json(sock, FRAME_FILE_DONE, {"path": str(saved_path), "size": received})
+        return True, str(saved_path), received, None
     except Exception as exc:
         with suppress(OSError):
             send_json(sock, FRAME_ERROR, {"error": str(exc), "exc_type": type(exc).__name__})
+        return False, target, 0, str(exc)
 
 
-def server_handle_file_get(sock: socket.socket, req: dict[str, Any]) -> None:
-    """Stream a requested file/directory back to a client."""
+def server_handle_file_get(
+    sock: socket.socket,
+    req: dict[str, Any],
+) -> tuple[bool, str, int, str | None]:
+    """Stream a requested file/directory to a client and return (ok, path, nbytes, error)."""
+    target = str(req.get("src", "")) if isinstance(req, dict) else ""
     try:
         raw_src = str(req["src"])
         src_path = Path(raw_src).expanduser().resolve()
+        target = str(src_path)
         if not src_path.exists():
             raise FileNotFoundError(f"Remote path not found: {src_path}")
         is_dir = src_path.is_dir()
@@ -366,6 +377,8 @@ def server_handle_file_get(sock: socket.socket, req: dict[str, Any]) -> None:
         )
         total, sha256_hex = _stream_source_to_frames(sock, src_path, arcname=safe_name)
         send_json(sock, FRAME_FILE_DONE, {"size": total, "sha256": sha256_hex})
+        return True, str(src_path), total, None
     except Exception as exc:
         with suppress(OSError):
             send_json(sock, FRAME_ERROR, {"error": str(exc), "exc_type": type(exc).__name__})
+        return False, target, 0, str(exc)
